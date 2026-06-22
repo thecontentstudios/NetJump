@@ -1,0 +1,375 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" font-family="Segoe UI, Arial, sans-serif">
+  <!-- Mockup of the NetJump main HUD. Sanitized example data; not a real screenshot. -->
+
+  <defs>
+    <linearGradient id="upGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#3fb950" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#3fb950" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="dotUp" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#5fd770"/>
+      <stop offset="100%" stop-color="#2da840"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Window background -->
+  <rect width="1600" height="900" fill="#0f1420"/>
+
+  <!-- Title bar -->
+  <rect x="0" y="0" width="1600" height="32" fill="#161b27"/>
+  <text x="14" y="21" fill="#d7dde6" font-size="12" font-weight="600">NetJump HUD - Real-time network + security console</text>
+  <g transform="translate(1500,0)">
+    <rect x="0"   y="0" width="33" height="32" fill="#161b27"/><text x="11" y="21" fill="#8b95a8" font-size="14">_</text>
+    <rect x="33"  y="0" width="33" height="32" fill="#161b27"/><text x="44" y="21" fill="#8b95a8" font-size="11">▢</text>
+    <rect x="66"  y="0" width="34" height="32" fill="#161b27"/><text x="77" y="21" fill="#8b95a8" font-size="14">×</text>
+  </g>
+
+  <!-- Menu bar -->
+  <rect x="0" y="32" width="1600" height="28" fill="#11172a"/>
+  <g fill="#8b95a8" font-size="12">
+    <text x="14" y="50">File</text><text x="48" y="50">View</text><text x="86" y="50">Diagnose</text><text x="142" y="50">Settings</text><text x="194" y="50">Help</text>
+  </g>
+
+  <!-- ==================== TOP STATUS BAND ==================== -->
+  <!-- Health grade circle -->
+  <circle cx="60" cy="120" r="34" fill="#1a2030" stroke="#3fb950" stroke-width="3"/>
+  <text x="60" y="129" fill="#3fb950" font-size="32" font-weight="700" text-anchor="middle">B</text>
+  <text x="60" y="172" fill="#8b95a8" font-size="9" text-anchor="middle">HEALTH</text>
+
+  <!-- Adapter combo -->
+  <rect x="110" y="78" width="280" height="34" fill="#1a2030" stroke="#2a3142" rx="4"/>
+  <text x="120" y="88" fill="#58a6ff" font-size="9" font-weight="700">ADAPTER</text>
+  <text x="120" y="105" fill="#d7dde6" font-size="13">Ethernet (Realtek PCIe GbE)  ▾</text>
+
+  <!-- Big link-state dot -->
+  <circle cx="445" cy="120" r="38" fill="url(#upGlow)"/>
+  <circle cx="445" cy="120" r="22" fill="url(#dotUp)"/>
+  <text x="495" y="115" fill="#3fb950" font-size="28" font-weight="700">UP</text>
+  <text x="495" y="138" fill="#8b95a8" font-size="11">1 Gbps · 2h 14m up · 0 flaps</text>
+
+  <!-- Metric tiles (6 across the top right) -->
+  <g font-size="9" font-weight="700">
+    <g transform="translate(770, 78)">
+      <rect width="115" height="80" fill="#1a2030" stroke="#2a3142" rx="4"/>
+      <text x="10" y="14" fill="#58a6ff">STATUS</text>
+      <text x="10" y="44" fill="#3fb950" font-size="20" font-weight="700">Up</text>
+      <text x="10" y="65" fill="#8b95a8" font-weight="400">Stable since boot</text>
+    </g>
+    <g transform="translate(890, 78)">
+      <rect width="115" height="80" fill="#1a2030" stroke="#2a3142" rx="4"/>
+      <text x="10" y="14" fill="#58a6ff">LINK SPEED</text>
+      <text x="10" y="44" fill="#d7dde6" font-size="20" font-weight="700">1 Gbps</text>
+      <text x="10" y="65" fill="#8b95a8" font-weight="400">Full-duplex</text>
+    </g>
+    <g transform="translate(1010, 78)">
+      <rect width="115" height="80" fill="#1a2030" stroke="#2a3142" rx="4"/>
+      <text x="10" y="14" fill="#58a6ff">UPTIME</text>
+      <text x="10" y="44" fill="#d7dde6" font-size="20" font-weight="700">2h 14m</text>
+      <text x="10" y="65" fill="#8b95a8" font-weight="400">since 11:42</text>
+    </g>
+    <g transform="translate(1130, 78)">
+      <rect width="115" height="80" fill="#1a2030" stroke="#2a3142" rx="4"/>
+      <text x="10" y="14" fill="#58a6ff">FLAPS</text>
+      <text x="10" y="44" fill="#d7dde6" font-size="20" font-weight="700">0</text>
+      <text x="10" y="65" fill="#8b95a8" font-weight="400">this session</text>
+    </g>
+    <g transform="translate(1250, 78)">
+      <rect width="115" height="80" fill="#1a2030" stroke="#2a3142" rx="4"/>
+      <text x="10" y="14" fill="#58a6ff">LAST INCIDENT</text>
+      <text x="10" y="44" fill="#d29922" font-size="14" font-weight="700">Retrans spike</text>
+      <text x="10" y="65" fill="#8b95a8" font-weight="400">17 min ago</text>
+    </g>
+    <g transform="translate(1370, 78)">
+      <rect width="215" height="80" fill="#1a2030" stroke="#2a3142" rx="4"/>
+      <text x="10" y="14" fill="#58a6ff">TOP CAUSE</text>
+      <text x="10" y="38" fill="#d7dde6" font-size="12" font-weight="700">Background SCCM check-in</text>
+      <text x="10" y="54" fill="#d29922" font-size="10" font-weight="400">90% confidence · ~180 s cycle</text>
+      <text x="10" y="69" fill="#8b95a8" font-size="9" font-weight="400">Auto-fix SAFE available</text>
+    </g>
+  </g>
+
+  <!-- ==================== SPARKLINE STRIP ==================== -->
+  <g transform="translate(14, 180)">
+    <text x="0" y="10" fill="#58a6ff" font-size="9" font-weight="700">LIVE COUNTERS  (60-sample histories)</text>
+  </g>
+  <g font-size="9" font-weight="700">
+    <!-- 6 sparkline tiles -->
+    <g transform="translate(14, 195)">
+      <rect width="258" height="58" fill="#1a2030" stroke="#2a3142" rx="3"/>
+      <text x="10" y="14" fill="#8b95a8">RX ERRORS / s</text>
+      <text x="10" y="34" fill="#3fb950" font-size="16" font-weight="700">0.0</text>
+      <polyline points="100,46 110,46 120,44 130,46 140,46 150,46 160,45 170,46 180,46 190,46 200,46 210,46 220,46 230,46 240,46" stroke="#3fb950" fill="none" stroke-width="1.5"/>
+    </g>
+    <g transform="translate(278, 195)">
+      <rect width="258" height="58" fill="#1a2030" stroke="#2a3142" rx="3"/>
+      <text x="10" y="14" fill="#8b95a8">RX DISCARDS / s</text>
+      <text x="10" y="34" fill="#3fb950" font-size="16" font-weight="700">0.0</text>
+      <polyline points="100,46 110,46 120,46 130,46 140,46 150,46 160,46 170,46 180,46 190,46 200,46 210,46 220,46 230,46 240,46" stroke="#3fb950" fill="none" stroke-width="1.5"/>
+    </g>
+    <g transform="translate(542, 195)">
+      <rect width="258" height="58" fill="#1a2030" stroke="#2a3142" rx="3"/>
+      <text x="10" y="14" fill="#8b95a8">THROUGHPUT MB/s</text>
+      <text x="10" y="34" fill="#58a6ff" font-size="16" font-weight="700">2.4</text>
+      <polyline points="100,42 110,40 120,38 130,42 140,36 150,40 160,30 170,28 180,32 190,38 200,40 210,32 220,28 230,30 240,32" stroke="#58a6ff" fill="none" stroke-width="1.5"/>
+    </g>
+    <g transform="translate(806, 195)">
+      <rect width="258" height="58" fill="#1a2030" stroke="#2a3142" rx="3"/>
+      <text x="10" y="14" fill="#8b95a8">TCP RETRANS / s</text>
+      <text x="10" y="34" fill="#d29922" font-size="16" font-weight="700">3.2</text>
+      <polyline points="100,40 110,38 120,42 130,40 140,32 150,28 160,18 170,12 180,14 190,18 200,24 210,32 220,38 230,40 240,40" stroke="#d29922" fill="none" stroke-width="1.5"/>
+    </g>
+    <g transform="translate(1070, 195)">
+      <rect width="258" height="58" fill="#1a2030" stroke="#2a3142" rx="3"/>
+      <text x="10" y="14" fill="#8b95a8">CPU MAX CORE %</text>
+      <text x="10" y="34" fill="#d7dde6" font-size="16" font-weight="700">31</text>
+      <polyline points="100,38 110,34 120,30 130,36 140,32 150,28 160,30 170,34 180,38 190,32 200,28 210,36 220,40 230,34 240,30" stroke="#d7dde6" fill="none" stroke-width="1.5"/>
+    </g>
+    <g transform="translate(1334, 195)">
+      <rect width="252" height="58" fill="#1a2030" stroke="#2a3142" rx="3"/>
+      <text x="10" y="14" fill="#8b95a8">MEMORY %</text>
+      <text x="10" y="34" fill="#d7dde6" font-size="16" font-weight="700">47</text>
+      <polyline points="100,38 110,38 120,38 130,38 140,38 150,38 160,38 170,38 180,38 190,36 200,36 210,36 220,36 230,36 240,36" stroke="#d7dde6" fill="none" stroke-width="1.5"/>
+    </g>
+  </g>
+
+  <!-- ==================== ACTIVITY RIBBON ==================== -->
+  <g transform="translate(14, 265)">
+    <text x="0" y="10" fill="#58a6ff" font-size="9" font-weight="700">ACTIVITY  (last 60 min)</text>
+  </g>
+  <rect x="14" y="275" width="1572" height="22" fill="#1a2030" stroke="#2a3142" rx="3"/>
+  <!-- Tick marks -->
+  <g fill="#3fb950"><circle cx="60"  cy="286" r="3"/><circle cx="190" cy="286" r="3"/><circle cx="380" cy="286" r="3"/><circle cx="560" cy="286" r="3"/></g>
+  <g fill="#d29922"><circle cx="900" cy="286" r="3"/><circle cx="1100" cy="286" r="3"/></g>
+  <g fill="#58a6ff"><circle cx="1380" cy="286" r="3"/><circle cx="1480" cy="286" r="3"/></g>
+  <text x="20" y="293" fill="#8b95a8" font-size="8" opacity="0.7">-60m</text>
+  <text x="780" y="293" fill="#8b95a8" font-size="8" opacity="0.7">-30m</text>
+  <text x="1546" y="293" fill="#8b95a8" font-size="8" opacity="0.7">now</text>
+
+  <!-- ==================== MIDDLE: PING CHART + LOCAL NET INFO ==================== -->
+  <!-- LOCAL NET INFO sidebar -->
+  <rect x="14" y="310" width="280" height="380" fill="#1a2030" stroke="#2a3142" rx="3"/>
+  <text x="24" y="328" fill="#58a6ff" font-size="9" font-weight="700">LOCAL NET INFO</text>
+  <g font-size="11" fill="#d7dde6">
+    <g transform="translate(24,344)">
+      <text fill="#8b95a8" font-size="9">ADAPTER</text>
+      <text y="14">Ethernet · Realtek PCIe GbE</text>
+    </g>
+    <g transform="translate(24,376)">
+      <text fill="#8b95a8" font-size="9">IPv4 · MASK</text>
+      <text y="14">192.168.1.42 / 24</text>
+    </g>
+    <g transform="translate(24,408)">
+      <text fill="#8b95a8" font-size="9">GATEWAY · MAC</text>
+      <text y="14">192.168.1.1 · A8:5E:45:..:.. </text>
+    </g>
+    <g transform="translate(24,440)">
+      <text fill="#8b95a8" font-size="9">DNS</text>
+      <text y="14">1.1.1.1, 8.8.8.8</text>
+    </g>
+    <g transform="translate(24,472)">
+      <text fill="#8b95a8" font-size="9">DHCP LEASE</text>
+      <text y="14">23 h 14 m remaining</text>
+    </g>
+    <g transform="translate(24,504)">
+      <text fill="#8b95a8" font-size="9">PUBLIC IP</text>
+      <text y="14">203.0.113.42  (US · ISP)</text>
+    </g>
+    <g transform="translate(24,536)">
+      <text fill="#8b95a8" font-size="9">MTU · MSS</text>
+      <text y="14">1500 · 1460</text>
+    </g>
+  </g>
+  <!-- RESET button row -->
+  <g transform="translate(24, 580)" font-size="9" fill="#d7dde6">
+    <text fill="#8b95a8" font-size="9" y="0">RESET</text>
+    <g transform="translate(0, 10)">
+      <rect width="48" height="22" fill="#2a3142" stroke="#3a4255" rx="3"/><text x="24" y="15" text-anchor="middle">DHCP</text>
+      <rect x="54" width="48" height="22" fill="#2a3142" stroke="#3a4255" rx="3"/><text x="78" y="15" text-anchor="middle">DNS</text>
+      <rect x="108" width="48" height="22" fill="#2a3142" stroke="#3a4255" rx="3"/><text x="132" y="15" text-anchor="middle">ARP</text>
+      <rect x="162" width="48" height="22" fill="#2a3142" stroke="#3a4255" rx="3"/><text x="186" y="15" text-anchor="middle">MTU</text>
+      <rect x="216" width="48" height="22" fill="#2a3142" stroke="#3a4255" rx="3"/><text x="240" y="15" text-anchor="middle">STACK</text>
+    </g>
+  </g>
+  <!-- Capture status -->
+  <g transform="translate(24, 638)" font-size="10">
+    <circle cx="6" cy="6" r="5" fill="#3fb950"/>
+    <text x="20" y="10" fill="#3fb950">capture: rolling 50 MB</text>
+    <text x="20" y="26" fill="#8b95a8" font-size="9">pktmon active · saves on flap</text>
+  </g>
+
+  <!-- PING CHART -->
+  <rect x="302" y="310" width="1284" height="290" fill="#1a2030" stroke="#2a3142" rx="3"/>
+  <text x="316" y="328" fill="#58a6ff" font-size="9" font-weight="700">60-SECOND PING CHART</text>
+  <g font-size="9" fill="#8b95a8">
+    <text x="1320" y="328">Gateway</text><circle cx="1378" cy="324" r="4" fill="#3fb950"/>
+    <text x="1395" y="328">1.1.1.1</text><circle cx="1442" cy="324" r="4" fill="#58a6ff"/>
+    <text x="1459" y="328">8.8.8.8</text><circle cx="1506" cy="324" r="4" fill="#d29922"/>
+    <text x="1523" y="328">github</text><circle cx="1570" cy="324" r="4" fill="#bf6dff"/>
+  </g>
+  <!-- Y-axis labels -->
+  <g font-size="9" fill="#8b95a8">
+    <text x="320" y="358">200ms</text><line x1="360" y1="354" x2="1576" y2="354" stroke="#2a3142" stroke-dasharray="3,3"/>
+    <text x="320" y="425">100ms</text><line x1="360" y1="421" x2="1576" y2="421" stroke="#2a3142" stroke-dasharray="3,3"/>
+    <text x="320" y="492">50ms</text><line x1="360" y1="488" x2="1576" y2="488" stroke="#2a3142" stroke-dasharray="3,3"/>
+    <text x="320" y="560">10ms</text><line x1="360" y1="556" x2="1576" y2="556" stroke="#2a3142" stroke-dasharray="3,3"/>
+  </g>
+  <!-- Ping lines (60 samples, x from 360..1576 = 1216px wide) -->
+  <polyline points="360,548 380,545 400,548 420,547 440,549 460,548 480,547 500,548 520,548 540,549 560,548 580,548 600,547 620,549 640,548 660,547 680,548 700,549 720,548 740,548 760,548 780,548 800,549 820,548 840,547 860,548 880,548 900,549 920,548 940,547 960,548 980,549 1000,548 1020,547 1040,548 1060,548 1080,549 1100,548 1120,547 1140,548 1160,549 1180,548 1200,548 1220,547 1240,548 1260,549 1280,548 1300,547 1320,548 1340,548 1360,549 1380,548 1400,548 1420,549 1440,548 1460,547 1480,548 1500,549 1520,548 1540,547 1560,548" stroke="#3fb950" fill="none" stroke-width="1.5"/>
+  <polyline points="360,498 380,495 400,494 420,496 440,495 460,494 480,495 500,494 520,496 540,495 560,494 580,496 600,494 620,495 640,494 660,495 680,494 700,496 720,495 740,494 760,495 780,494 800,494 820,495 840,494 860,496 880,494 900,495 920,494 940,496 960,494 980,495 1000,494 1020,494 1040,496 1060,494 1080,495 1100,496 1120,494 1140,495 1160,494 1180,496 1200,494 1220,495 1240,494 1260,494 1280,495 1300,494 1320,496 1340,494 1360,495 1380,494 1400,495 1420,494 1440,496 1460,494 1480,495 1500,494 1520,494 1540,495 1560,494" stroke="#58a6ff" fill="none" stroke-width="1.5"/>
+  <polyline points="360,478 380,476 400,474 420,478 440,475 460,476 480,478 500,474 520,475 540,476 560,478 580,475 600,474 620,478 640,475 660,476 680,478 700,474 720,475 740,476 760,478 780,475 800,476 820,478 840,474 860,475 880,476 900,478 920,475 940,474 960,476 980,478 1000,475 1020,476 1040,474 1060,478 1080,475 1100,476 1120,478 1140,474 1160,476 1180,478 1200,475 1220,474 1240,476 1260,478 1280,475 1300,474 1320,476 1340,478 1360,475 1380,476 1400,474 1420,478 1440,475 1460,476 1480,478 1500,474 1520,475 1540,476 1560,478" stroke="#d29922" fill="none" stroke-width="1.5"/>
+
+  <!-- ==================== BOTTOM: TABS + FINDINGS + EVENTS ==================== -->
+  <!-- Tab bar -->
+  <g transform="translate(14, 610)" font-size="11" font-weight="600">
+    <rect width="170" height="32" fill="#1a2030" stroke="#3fb950" stroke-width="2" rx="3"/>
+    <text x="14" y="22" fill="#3fb950">DIAGNOSTICS</text>
+    <g fill="#8b95a8">
+      <text x="186" y="22">PROCESSES</text>
+      <text x="266" y="22">TRAFFIC</text>
+      <text x="328" y="22">FLOWS</text>
+      <text x="386" y="22">PERSISTENCE</text>
+      <text x="478" y="22">HISTORY</text>
+      <text x="540" y="22">DNS</text>
+    </g>
+    <!-- Right-side controls -->
+    <g transform="translate(700, 4)">
+      <rect width="100" height="24" fill="#15803d" stroke="#3fb950" rx="3"/>
+      <text x="50" y="16" fill="#ffffff" text-anchor="middle">▶ RE-SCAN</text>
+      <rect x="110" width="120" height="24" fill="#2a3142" stroke="#3a4255" rx="3"/>
+      <text x="170" y="16" fill="#d7dde6" text-anchor="middle">Apply Fixes (5)</text>
+    </g>
+  </g>
+
+  <!-- Diagnostics panel (findings) -->
+  <rect x="14" y="650" width="1100" height="240" fill="#1a2030" stroke="#2a3142" rx="3"/>
+  <text x="28" y="668" fill="#58a6ff" font-size="9" font-weight="700">FINDINGS  ·  Scan complete in 18.4 s (12:38:14)</text>
+  <text x="800" y="668" fill="#8b95a8" font-size="9">CRITICAL 2 · WARN 5 · INFO 4 · HEALTHY 17</text>
+
+  <!-- Finding rows -->
+  <g font-size="11">
+    <g transform="translate(28, 680)">
+      <rect width="40" height="18" fill="#f85149" rx="2"/>
+      <text x="20" y="13" fill="#ffffff" font-size="9" font-weight="700" text-anchor="middle">FAIL</text>
+      <text x="50" y="13" fill="#d7dde6">BYOVD</text>
+      <text x="120" y="13" fill="#d7dde6">Vulnerable driver loaded:  rtcore64.sys  (MSI Afterburner, CVE-2019-16098)</text>
+      <rect x="780" y="0" width="50" height="18" fill="#3a1f5c" stroke="#bf6dff" rx="2"/>
+      <text x="805" y="13" fill="#bf6dff" font-size="9" font-weight="700" text-anchor="middle">T1068</text>
+      <text x="836" y="13" fill="#7ee787" font-size="10">Fix: Uninstall MSI Afterburner or update to v4.6.5+</text>
+    </g>
+    <g transform="translate(28, 706)">
+      <rect width="40" height="18" fill="#f85149" rx="2"/>
+      <text x="20" y="13" fill="#ffffff" font-size="9" font-weight="700" text-anchor="middle">FAIL</text>
+      <text x="50" y="13" fill="#d7dde6">Threat-intel</text>
+      <text x="120" y="13" fill="#d7dde6">Outbound to 185.220.101.42 matched FireHOL Level 1 (chrome.exe pid 14288)</text>
+      <rect x="780" y="0" width="50" height="18" fill="#3a1f5c" stroke="#bf6dff" rx="2"/>
+      <text x="805" y="13" fill="#bf6dff" font-size="9" font-weight="700" text-anchor="middle">T1071</text>
+      <text x="836" y="13" fill="#7ee787" font-size="10">Fix: Block via firewall (right-click → Block remote IP)</text>
+    </g>
+    <g transform="translate(28, 732)">
+      <rect width="40" height="18" fill="#d29922" rx="2"/>
+      <text x="20" y="13" fill="#ffffff" font-size="9" font-weight="700" text-anchor="middle">WARN</text>
+      <text x="50" y="13" fill="#d7dde6">Hardening</text>
+      <text x="120" y="13" fill="#d7dde6">SMBv1 client is enabled — superseded by SMB 3.x, exploit vector for EternalBlue</text>
+      <text x="836" y="13" fill="#7ee787" font-size="10">Fix: Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol</text>
+    </g>
+    <g transform="translate(28, 758)">
+      <rect width="40" height="18" fill="#d29922" rx="2"/>
+      <text x="20" y="13" fill="#ffffff" font-size="9" font-weight="700" text-anchor="middle">WARN</text>
+      <text x="50" y="13" fill="#d7dde6">Counters</text>
+      <text x="120" y="13" fill="#d7dde6">1,136 RX errors/discards accumulated since boot</text>
+      <text x="836" y="13" fill="#7ee787" font-size="10">Fix: Swap Cat5e/6 cable or try different switch port</text>
+    </g>
+    <g transform="translate(28, 784)">
+      <rect width="40" height="18" fill="#d29922" rx="2"/>
+      <text x="20" y="13" fill="#ffffff" font-size="9" font-weight="700" text-anchor="middle">WARN</text>
+      <text x="50" y="13" fill="#d7dde6">DNS</text>
+      <text x="120" y="13" fill="#d7dde6">DoH detected: telemetry.example.com:443 via non-browser process</text>
+      <rect x="780" y="0" width="50" height="18" fill="#3a1f5c" stroke="#bf6dff" rx="2"/>
+      <text x="805" y="13" fill="#bf6dff" font-size="9" font-weight="700" text-anchor="middle">T1572</text>
+      <text x="836" y="13" fill="#7ee787" font-size="10">Fix: Inspect process tree, block if unexpected</text>
+    </g>
+    <g transform="translate(28, 810)">
+      <rect width="40" height="18" fill="#58a6ff" rx="2"/>
+      <text x="20" y="13" fill="#ffffff" font-size="9" font-weight="700" text-anchor="middle">INFO</text>
+      <text x="50" y="13" fill="#d7dde6">Beacon</text>
+      <text x="120" y="13" fill="#d7dde6">Periodic connection: msedge.exe → 13.107.42.14:443 every 180.2 s (±2.1 s)</text>
+      <text x="836" y="13" fill="#8b95a8" font-size="10">Pattern match: MS telemetry interval (low risk)</text>
+    </g>
+    <g transform="translate(28, 836)">
+      <rect width="40" height="18" fill="#3fb950" rx="2"/>
+      <text x="20" y="13" fill="#ffffff" font-size="9" font-weight="700" text-anchor="middle">OK</text>
+      <text x="50" y="13" fill="#d7dde6">Defender</text>
+      <text x="120" y="13" fill="#d7dde6">Real-time protection ON, signatures 0d old, no quarantined items</text>
+    </g>
+    <g transform="translate(28, 862)">
+      <rect width="40" height="18" fill="#3fb950" rx="2"/>
+      <text x="20" y="13" fill="#ffffff" font-size="9" font-weight="700" text-anchor="middle">OK</text>
+      <text x="50" y="13" fill="#d7dde6">Hosts file</text>
+      <text x="120" y="13" fill="#d7dde6">Hosts file clean (no tampering, no proxy hijack, no ad-block surprises)</text>
+    </g>
+  </g>
+
+  <!-- LIVE EVENTS panel (right side) -->
+  <rect x="1124" y="650" width="462" height="240" fill="#1a2030" stroke="#2a3142" rx="3"/>
+  <g transform="translate(1138, 668)">
+    <text x="0" y="0" fill="#58a6ff" font-size="9" font-weight="700">LIVE EVENTS  (37)</text>
+    <text x="280" y="0" fill="#8b95a8" font-size="9">DNS · FLOWS · TRAFC · PROCS · PERSI · SYSTM</text>
+  </g>
+  <g font-size="10">
+    <g transform="translate(1138, 690)">
+      <text x="0"  y="0" fill="#8b95a8" font-family="Consolas">12:38:32</text>
+      <rect x="60" y="-10" width="38" height="14" fill="#7c3aed" rx="2"/><text x="79" y="0" fill="#fff" font-size="8" font-weight="700" text-anchor="middle">SYSTM</text>
+      <rect x="104" y="-10" width="38" height="14" fill="#f85149" rx="2"/><text x="123" y="0" fill="#fff" font-size="8" font-weight="700" text-anchor="middle">CRIT</text>
+      <text x="150" y="0" fill="#d7dde6">BYOVD: rtcore64.sys (MSI Afterburner)</text>
+    </g>
+    <g transform="translate(1138, 712)">
+      <text x="0"  y="0" fill="#8b95a8" font-family="Consolas">12:38:31</text>
+      <rect x="60" y="-10" width="38" height="14" fill="#0ea5e9" rx="2"/><text x="79" y="0" fill="#fff" font-size="8" font-weight="700" text-anchor="middle">FLOWS</text>
+      <rect x="104" y="-10" width="38" height="14" fill="#f85149" rx="2"/><text x="123" y="0" fill="#fff" font-size="8" font-weight="700" text-anchor="middle">HIGH</text>
+      <text x="150" y="0" fill="#d7dde6">FireHOL hit: 185.220.101.42:443</text>
+    </g>
+    <g transform="translate(1138, 734)">
+      <text x="0"  y="0" fill="#8b95a8" font-family="Consolas">12:38:28</text>
+      <rect x="60" y="-10" width="38" height="14" fill="#22c55e" rx="2"/><text x="79" y="0" fill="#fff" font-size="8" font-weight="700" text-anchor="middle">PROCS</text>
+      <rect x="104" y="-10" width="38" height="14" fill="#d29922" rx="2"/><text x="123" y="0" fill="#fff" font-size="8" font-weight="700" text-anchor="middle">LOW</text>
+      <text x="150" y="0" fill="#d7dde6">New process: msedge.exe (pid 14288)</text>
+    </g>
+    <g transform="translate(1138, 756)">
+      <text x="0"  y="0" fill="#8b95a8" font-family="Consolas">12:38:14</text>
+      <rect x="60" y="-10" width="38" height="14" fill="#7c3aed" rx="2"/><text x="79" y="0" fill="#fff" font-size="8" font-weight="700" text-anchor="middle">SYSTM</text>
+      <rect x="104" y="-10" width="38" height="14" fill="#3fb950" rx="2"/><text x="123" y="0" fill="#fff" font-size="8" font-weight="700" text-anchor="middle">OK</text>
+      <text x="150" y="0" fill="#d7dde6">Scan complete in 18.4s (2 FAIL, 5 WARN)</text>
+    </g>
+    <g transform="translate(1138, 778)">
+      <text x="0"  y="0" fill="#8b95a8" font-family="Consolas">12:37:56</text>
+      <rect x="60" y="-10" width="38" height="14" fill="#ea580c" rx="2"/><text x="79" y="0" fill="#fff" font-size="8" font-weight="700" text-anchor="middle">TRAFC</text>
+      <rect x="104" y="-10" width="38" height="14" fill="#d29922" rx="2"/><text x="123" y="0" fill="#fff" font-size="8" font-weight="700" text-anchor="middle">LOW</text>
+      <text x="150" y="0" fill="#d7dde6">TCP retrans spike: 3.2/s (was 0.0)</text>
+    </g>
+    <g transform="translate(1138, 800)">
+      <text x="0"  y="0" fill="#8b95a8" font-family="Consolas">12:37:50</text>
+      <rect x="60" y="-10" width="38" height="14" fill="#3b82f6" rx="2"/><text x="79" y="0" fill="#fff" font-size="8" font-weight="700" text-anchor="middle">DNS</text>
+      <rect x="104" y="-10" width="38" height="14" fill="#3fb950" rx="2"/><text x="123" y="0" fill="#fff" font-size="8" font-weight="700" text-anchor="middle">OK</text>
+      <text x="150" y="0" fill="#d7dde6">Resolved: github.com → 140.82.121.4 (12ms)</text>
+    </g>
+    <g transform="translate(1138, 822)">
+      <text x="0"  y="0" fill="#8b95a8" font-family="Consolas">12:37:42</text>
+      <rect x="60" y="-10" width="38" height="14" fill="#a855f7" rx="2"/><text x="79" y="0" fill="#fff" font-size="8" font-weight="700" text-anchor="middle">PERSI</text>
+      <rect x="104" y="-10" width="38" height="14" fill="#3fb950" rx="2"/><text x="123" y="0" fill="#fff" font-size="8" font-weight="700" text-anchor="middle">OK</text>
+      <text x="150" y="0" fill="#d7dde6">No new Run-key entries (baseline diff)</text>
+    </g>
+    <g transform="translate(1138, 844)">
+      <text x="0"  y="0" fill="#8b95a8" font-family="Consolas">12:37:14</text>
+      <rect x="60" y="-10" width="38" height="14" fill="#7c3aed" rx="2"/><text x="79" y="0" fill="#fff" font-size="8" font-weight="700" text-anchor="middle">SYSTM</text>
+      <rect x="104" y="-10" width="38" height="14" fill="#58a6ff" rx="2"/><text x="123" y="0" fill="#fff" font-size="8" font-weight="700" text-anchor="middle">INFO</text>
+      <text x="150" y="0" fill="#d7dde6">Threat-intel refreshed: 41,892 v4 + 3,114 v6</text>
+    </g>
+    <g transform="translate(1138, 866)">
+      <text x="0"  y="0" fill="#8b95a8" font-family="Consolas">12:36:00</text>
+      <rect x="60" y="-10" width="38" height="14" fill="#7c3aed" rx="2"/><text x="79" y="0" fill="#fff" font-size="8" font-weight="700" text-anchor="middle">SYSTM</text>
+      <rect x="104" y="-10" width="38" height="14" fill="#58a6ff" rx="2"/><text x="123" y="0" fill="#fff" font-size="8" font-weight="700" text-anchor="middle">INFO</text>
+      <text x="150" y="0" fill="#d7dde6">Vuln-driver list refreshed: 459 entries</text>
+    </g>
+  </g>
+</svg>

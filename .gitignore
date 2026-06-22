@@ -1,0 +1,39 @@
+# User data and machine-specific state - never commit.
+Reports/
+
+# Installer build output - large binaries belong in Releases, not the repo.
+Installer/
+*.exe
+
+# Dev scratch / smoke-test artifacts.
+launch-debug.log
+launch-test.log
+smoke-error.txt
+test-all.txt
+test-clean.json
+test-headless.json
+*.log
+
+# Windows shortcut files (machine-specific paths).
+*.lnk
+
+# Editor swap / temp files.
+*.swp
+*.swo
+*~
+.vs/
+.vscode/
+*.suo
+*.user
+
+# pktmon capture buffer (if it ever leaks outside Reports/).
+pktmon-current.etl
+*.etl
+*.pcapng
+
+# Backup files.
+*.bak
+*.orig
+
+# Claude Code local harness state (per-machine, not project content).
+.claude/

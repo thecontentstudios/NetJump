@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 700" font-family="Segoe UI, Arial, sans-serif">
+  <!-- Mockup of the NetJump Apply Fixes dialog. Sanitized example fixes; not a real screenshot. -->
+
+  <!-- Window chrome -->
+  <rect width="900" height="700" fill="#0f1420"/>
+  <rect x="0" y="0" width="900" height="32" fill="#161b27"/>
+  <text x="14" y="21" fill="#d7dde6" font-size="12" font-weight="600">Apply Fixes  ·  7 recommended  ·  AUTO-APPLY ALL SAFE available</text>
+  <g transform="translate(866,0)">
+    <rect x="0" y="0" width="34" height="32" fill="#161b27"/><text x="11" y="21" fill="#8b95a8" font-size="14">×</text>
+  </g>
+
+  <!-- Header strip -->
+  <rect x="0" y="32" width="900" height="56" fill="#11172a"/>
+  <text x="20" y="56" fill="#58a6ff" font-size="11" font-weight="700">REVIEW · SELECT · APPLY</text>
+  <text x="20" y="75" fill="#8b95a8" font-size="11">Each fix shows the exact PowerShell command that will run. Audit log: Reports\Actions\</text>
+
+  <!-- ==================== SAFE TIER ==================== -->
+  <g transform="translate(20, 104)">
+    <rect width="860" height="22" fill="#15803d" rx="3"/>
+    <text x="12" y="16" fill="#ffffff" font-size="11" font-weight="700">SAFE  ·  3 fixes  ·  reversible, no service restarts</text>
+    <rect x="700" y="0" width="156" height="22" fill="#22c55e" stroke="#3fb950" rx="3"/>
+    <text x="778" y="16" fill="#ffffff" font-size="11" font-weight="700" text-anchor="middle">▶ AUTO-APPLY ALL SAFE</text>
+  </g>
+
+  <!-- SAFE fix 1 -->
+  <g transform="translate(20, 134)">
+    <rect width="860" height="56" fill="#1a2030" stroke="#2a3142" rx="3"/>
+    <rect x="10" y="14" width="16" height="16" fill="#0f1420" stroke="#3fb950" stroke-width="2" rx="2"/>
+    <polyline points="14,22 17,25 22,18" stroke="#3fb950" stroke-width="2" fill="none"/>
+    <text x="38" y="22" fill="#d7dde6" font-size="12" font-weight="600">Flush DNS resolver cache</text>
+    <text x="38" y="40" fill="#8b95a8" font-size="10">DNS · Clears stale entries; cheapest fix for "site loads in browser A but not browser B" symptoms</text>
+    <text x="38" y="52" fill="#bf6dff" font-family="Consolas" font-size="9">ipconfig /flushdns</text>
+  </g>
+
+  <!-- SAFE fix 2 -->
+  <g transform="translate(20, 198)">
+    <rect width="860" height="56" fill="#1a2030" stroke="#2a3142" rx="3"/>
+    <rect x="10" y="14" width="16" height="16" fill="#0f1420" stroke="#3fb950" stroke-width="2" rx="2"/>
+    <polyline points="14,22 17,25 22,18" stroke="#3fb950" stroke-width="2" fill="none"/>
+    <text x="38" y="22" fill="#d7dde6" font-size="12" font-weight="600">Flush ARP table</text>
+    <text x="38" y="40" fill="#8b95a8" font-size="10">ARP · Removes stale MAC bindings; fixes "intermittent gateway timeout after switch swap"</text>
+    <text x="38" y="52" fill="#bf6dff" font-family="Consolas" font-size="9">arp -d *</text>
+  </g>
+
+  <!-- SAFE fix 3 -->
+  <g transform="translate(20, 262)">
+    <rect width="860" height="56" fill="#1a2030" stroke="#2a3142" rx="3"/>
+    <rect x="10" y="14" width="16" height="16" fill="#0f1420" stroke="#3fb950" stroke-width="2" rx="2"/>
+    <polyline points="14,22 17,25 22,18" stroke="#3fb950" stroke-width="2" fill="none"/>
+    <text x="38" y="22" fill="#d7dde6" font-size="12" font-weight="600">Re-enable TCP auto-tuning (was disabled by a previous Fix)</text>
+    <text x="38" y="40" fill="#8b95a8" font-size="10">TCP/IP · Window auto-tuning is on by default for a reason; disabling hurts modern bandwidth-delay products</text>
+    <text x="38" y="52" fill="#bf6dff" font-family="Consolas" font-size="9">netsh int tcp set global autotuninglevel=normal</text>
+  </g>
+
+  <!-- ==================== MODERATE TIER ==================== -->
+  <g transform="translate(20, 334)">
+    <rect width="860" height="22" fill="#92400e" rx="3"/>
+    <text x="12" y="16" fill="#ffffff" font-size="11" font-weight="700">MODERATE  ·  2 fixes  ·  service restarts, registry tweaks — review individually</text>
+  </g>
+
+  <!-- MODERATE fix 1 -->
+  <g transform="translate(20, 364)">
+    <rect width="860" height="56" fill="#1a2030" stroke="#2a3142" rx="3"/>
+    <rect x="10" y="14" width="16" height="16" fill="#0f1420" stroke="#3fb950" stroke-width="2" rx="2"/>
+    <polyline points="14,22 17,25 22,18" stroke="#3fb950" stroke-width="2" fill="none"/>
+    <text x="38" y="22" fill="#d7dde6" font-size="12" font-weight="600">Disable LLMNR (Link-Local Multicast Name Resolution)</text>
+    <text x="38" y="40" fill="#8b95a8" font-size="10">Hardening · LLMNR can be abused for credential theft on LAN. Disable on managed machines.</text>
+    <text x="38" y="52" fill="#bf6dff" font-family="Consolas" font-size="9">Set-ItemProperty HKLM:\SOFTWARE\Policies\...\DNSClient EnableMulticast 0</text>
+  </g>
+
+  <!-- MODERATE fix 2 -->
+  <g transform="translate(20, 428)">
+    <rect width="860" height="56" fill="#1a2030" stroke="#2a3142" rx="3"/>
+    <rect x="10" y="14" width="16" height="16" fill="#0f1420" stroke="#2a3142" stroke-width="2" rx="2"/>
+    <text x="38" y="22" fill="#d7dde6" font-size="12" font-weight="600">Disable NIC power-management ("Allow computer to turn off this device")</text>
+    <text x="38" y="40" fill="#8b95a8" font-size="10">Power · Common cause of flap-on-idle on Realtek + Intel adapters. Reversible via Device Manager.</text>
+    <text x="38" y="52" fill="#bf6dff" font-family="Consolas" font-size="9">Disable-NetAdapterPowerManagement -Name "Ethernet"</text>
+  </g>
+
+  <!-- ==================== DISRUPTIVE TIER ==================== -->
+  <g transform="translate(20, 500)">
+    <rect width="860" height="22" fill="#b91c1c" rx="3"/>
+    <text x="12" y="16" fill="#ffffff" font-size="11" font-weight="700">DISRUPTIVE  ·  2 fixes  ·  TCP/IP reset, NIC restart — confirm each individually</text>
+  </g>
+
+  <!-- DISRUPTIVE fix 1 -->
+  <g transform="translate(20, 530)">
+    <rect width="860" height="56" fill="#1a2030" stroke="#2a3142" rx="3"/>
+    <rect x="10" y="14" width="16" height="16" fill="#0f1420" stroke="#2a3142" stroke-width="2" rx="2"/>
+    <text x="38" y="22" fill="#d7dde6" font-size="12" font-weight="600">Reset TCP/IP stack to defaults</text>
+    <text x="38" y="40" fill="#8b95a8" font-size="10">Stack · Reboots networking. Use only after SAFE/MODERATE attempts haven't fixed it. Requires restart.</text>
+    <text x="38" y="52" fill="#f85149" font-family="Consolas" font-size="9">netsh int ip reset  ·  netsh winsock reset  ·  shutdown /r</text>
+  </g>
+
+  <!-- DISRUPTIVE fix 2 -->
+  <g transform="translate(20, 594)">
+    <rect width="860" height="56" fill="#1a2030" stroke="#2a3142" rx="3"/>
+    <rect x="10" y="14" width="16" height="16" fill="#0f1420" stroke="#2a3142" stroke-width="2" rx="2"/>
+    <text x="38" y="22" fill="#d7dde6" font-size="12" font-weight="600">Restart NIC driver (Disable + Enable adapter)</text>
+    <text x="38" y="40" fill="#8b95a8" font-size="10">NIC · Briefly drops the link (~3–8s). Will close all active connections. Useful for stuck driver state.</text>
+    <text x="38" y="52" fill="#f85149" font-family="Consolas" font-size="9">Disable-NetAdapter -Name "Ethernet" -Confirm:$false; Start-Sleep 2; Enable-NetAdapter ...</text>
+  </g>
+
+  <!-- ==================== FOOTER ==================== -->
+  <g transform="translate(20, 666)" font-size="11">
+    <text x="0"   y="0" fill="#8b95a8">3 SAFE selected. Each fix logs to Reports\Actions\action-*.json on apply.</text>
+    <g transform="translate(560, -12)">
+      <rect width="100"  height="24" fill="#2a3142" stroke="#3a4255" rx="3"/>
+      <text x="50"  y="16" fill="#d7dde6" text-anchor="middle">Cancel</text>
+      <rect x="110" width="120" height="24" fill="#15803d" stroke="#3fb950" rx="3"/>
+      <text x="170" y="16" fill="#ffffff" font-weight="600" text-anchor="middle">Apply Selected (3)</text>
+      <rect x="240" width="80"  height="24" fill="#2a3142" stroke="#3a4255" rx="3"/>
+      <text x="280" y="16" fill="#d7dde6" text-anchor="middle">Cancel</text>
+    </g>
+  </g>
+</svg>
