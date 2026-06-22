@@ -9,7 +9,7 @@
 #define MyAppName        "NetJump"
 #define MyAppVersion     "1.0.1"
 #define MyAppPublisher   "NetJump"
-#define MyAppURL         "https://github.com/"
+#define MyAppURL         "https://github.com/thecontentstudios/NetJump"
 #define MyAppExeName     "Run-NetJump.bat"
 #define MyAppIcon        "netjump.ico"
 

@@ -10,7 +10,8 @@ Continuous link / NIC / DNS / threat-intel monitoring with one-click remediation
 - **What it is:** A live dashboard that watches your Ethernet adapter, DNS resolver, TCP retransmit rate, listening processes, persistence entries, and external connections — all at once. Surfaces anomalies as graded findings with one-line fixes.
 - **What it solves:** Originally built to chase intermittent ethernet flaps. Grew into a SOC-lite tool for spotting beaconing C2, vulnerable kernel drivers, malicious persistence, and DNS hijacks on a single Windows machine.
 - **How it ships:** Single PowerShell file (`NetJump-Dashboard.ps1`) + a self-elevating launcher (`Run-NetJump.bat`). No install required for the script. The Inno Setup installer (`NetJump-Setup-1.0.1.exe`) is a convenience wrapper that adds Start Menu integration.
-- **License:** TBD.
+- **License:** MIT — see [LICENSE](LICENSE).
+- **Source:** https://github.com/thecontentstudios/NetJump
 
 ---
 
