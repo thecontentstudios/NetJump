@@ -8,6 +8,24 @@ This folder holds the marketing/distribution screenshots for NetJump.
 |---|---|---|
 | `01-hud-overview.svg` | SVG mockup | Main HUD layout — adapter combo, health grade, metric tiles, sparkline strip, ping chart, findings panel, LIVE EVENTS feed. Sanitized example data, not a real screenshot. |
 | `02-fix-picker.svg` | SVG mockup | Apply Fixes dialog showing the SAFE / MODERATE / DISRUPTIVE three-tier picker with example commands. |
+| `01-hud-overview-preview.png` | rendered PNG (1600×900) | The HUD SVG mockup rendered to PNG via headless Chrome. Use for blog posts, project pages, etc. |
+| `github-social-preview.png` | rendered PNG (1280×640) | Cropped to GitHub's exact social preview spec. Upload via repo Settings → Social preview. |
+| `real/01-main-hud.png` | **real capture** | Actual NetJump HUD captured from a live run. **Shows real network state — review and redact before publishing.** |
+| `Capture-Screenshots.ps1` | helper script | Re-runnable script that launches NetJump non-elevated and captures every tab + scan-complete view automatically. |
+| `_capture-helper.ps1` | internal | Win32-based window capture helpers used by the above. |
+
+## Generating more real captures
+
+Run the auto-capture script:
+
+```powershell
+cd D:\NetJump-Diagnostic
+.\Screenshots\Capture-Screenshots.ps1
+```
+
+It launches NetJump non-elevated, walks through every tab, kicks off a scan, and saves a numbered PNG for each view to `Screenshots\real\`. Non-elevated mode means some scan categories will show "needs admin" warnings — the UI itself is identical, just some checks are gated.
+
+If you want fully-admin captures (no "needs admin" warnings), launch NetJump via `Run-NetJump.bat` and use **Win+Shift+S** (Snipping Tool) to grab each tab manually. The auto-script can't drive an elevated NetJump because Windows UIPI blocks input from non-elevated processes.
 
 SVG opens in any modern browser. To convert to PNG for places that require raster images (Microsoft Store, GitHub social preview, etc.):
 
