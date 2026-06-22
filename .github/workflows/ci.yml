@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  parse:
+    name: Parse-validate PowerShell sources
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse NetJump-Dashboard.ps1
+        shell: pwsh
+        run: |
+          $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            'NetJump-Dashboard.ps1', [ref]$null, [ref]$errors)
+          if ($errors -and $errors.Count -gt 0) {
+            $errors | Select-Object -First 20 | ForEach-Object {
+              "::error file=NetJump-Dashboard.ps1,line=$($_.Extent.StartLineNumber),col=$($_.Extent.StartColumnNumber)::$($_.Message)"
+            }
+            throw ("Found {0} parser error(s) in NetJump-Dashboard.ps1" -f $errors.Count)
+          }
+          "Parsed OK ({0:N0} bytes)" -f (Get-Item 'NetJump-Dashboard.ps1').Length
+
+      - name: Parse legacy scripts
+        shell: pwsh
+        run: |
+          foreach ($script in @('NetJump-Scan.ps1','NetJump-Monitor.ps1')) {
+            if (-not (Test-Path $script)) { continue }
+            $errors = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseFile(
+              $script, [ref]$null, [ref]$errors)
+            if ($errors -and $errors.Count -gt 0) {
+              $errors | Select-Object -First 10 | ForEach-Object {
+                "::error file=$script,line=$($_.Extent.StartLineNumber)::$($_.Message)"
+              }
+              throw "Parser errors in $script"
+            }
+            "Parsed $script OK"
+          }
+
+  headless-smoke-test:
+    name: Headless -Json smoke test
+    runs-on: windows-latest
+    needs: parse
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run -Json mode and validate the JSON
+        shell: pwsh
+        run: |
+          # The CI runner has no Ethernet adapter, so many findings will be N/A.
+          # We're proving Update-Findings runs end-to-end and emits valid JSON, not
+          # validating any specific finding count.
+          $tmp = New-TemporaryFile
+          $err = New-TemporaryFile
+          $p = Start-Process -FilePath 'powershell.exe' `
+            -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','NetJump-Dashboard.ps1','-Json' `
+            -RedirectStandardOutput $tmp.FullName -RedirectStandardError $err.FullName `
+            -PassThru -Wait -WindowStyle Hidden
+          "Exit: $($p.ExitCode)"
+          $stderr = Get-Content $err.FullName -Raw
+          if ($stderr) { "STDERR:`n$stderr" }
+          $stdout = Get-Content $tmp.FullName -Raw
+          if ($p.ExitCode -ne 0) { throw "Non-zero exit: $($p.ExitCode)" }
+          if (-not $stdout) { throw "Empty stdout" }
+          try {
+            $obj = $stdout | ConvertFrom-Json
+            "JSON parsed OK. Top-level keys: $(@($obj.PSObject.Properties.Name) -join ', ')"
+            "Findings count: $(@($obj.findings).Count)"
+          } catch {
+            "RAW STDOUT (first 2000 chars):`n$($stdout.Substring(0, [Math]::Min(2000, $stdout.Length)))"
+            throw "JSON parse failed: $_"
+          }
+
+  build-installer:
+    name: Build Inno Setup installer
+    runs-on: windows-latest
+    needs: [parse, headless-smoke-test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Inno Setup 6
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          "ISCC path:"
+          (Get-Command iscc).Source
+
+      - name: Compile NetJump.iss
+        shell: pwsh
+        run: |
+          iscc NetJump.iss
+          Get-ChildItem Installer\ | Format-Table Name, Length
+
+      - name: Upload installer as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetJump-Installer-${{ github.sha }}
+          path: Installer/*.exe
+          if-no-files-found: error
+          retention-days: 30
