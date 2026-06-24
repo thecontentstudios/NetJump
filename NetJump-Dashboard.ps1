@@ -8326,6 +8326,10 @@ function Save-FlapDossier {
                             </StackPanel>
                             <TextBlock Text="{Binding Path}" Foreground="{DynamicResource BrushFgMuted}" FontSize="11" TextWrapping="Wrap" Margin="0,2,0,0"/>
                             <TextBlock Text="{Binding RemoteSummary}" Foreground="{DynamicResource BrushFgFaint}" FontSize="11" TextWrapping="Wrap" Margin="0,2,0,0"/>
+                            <StackPanel Orientation="Horizontal" Margin="0,3,0,0" Visibility="{Binding AncestryVisibility}">
+                              <TextBlock Text="↳" Foreground="{DynamicResource BrushFgFaint}" FontSize="10" Margin="0,0,4,0"/>
+                              <TextBlock Text="{Binding Ancestry}" Foreground="{Binding ChainRiskColor}" FontSize="10" FontFamily="Consolas" TextTrimming="CharacterEllipsis" ToolTip="Process ancestry: parent chain walked via Win32_Process. Red = suspicious chain (e.g. cmd/powershell -> curl/certutil)"/>
+                            </StackPanel>
                           </StackPanel>
                           <TextBlock Grid.Column="2" Text="{Binding SignerLabel}" Foreground="{Binding SignerColor}" FontSize="11" VerticalAlignment="Top"/>
                         </Grid>
@@ -9279,6 +9283,9 @@ function Save-FlapDossier {
                         ToolTip="Opens NetJump's Reports\ folder in Explorer. Contains HTML reports, flap dossiers (per-flap subfolders), session JSONs, and exported CSVs."/>
               <MenuItem x:Name="MenuOpenRules"   Header="Open custom detection rules folder"
                         ToolTip="Custom YARA-style rule files (process-name + remote IP/port patterns) live here. NetJump auto-loads any *.rules file on startup. Add your own to flag specific binaries / domains as HIGH-risk."/>
+              <Separator/>
+              <MenuItem x:Name="MenuReplaySnapshot" Header="Replay snapshot..."
+                        ToolTip="Re-load a previous scan's findings into the UI. Each scan auto-saves a snapshot to Reports\Snapshots\snapshot-*.json (kept rolling at 30). Useful for testing what a fix recommendation would do against historical data without recreating the original conditions."/>
             </ContextMenu>
           </Button.ContextMenu>
         </Button>
@@ -9475,7 +9482,7 @@ foreach ($name in 'Dot','DotGlow','AdapterCombo','AdapterDesc','StatusText','Lin
                   'MenuDriver','MenuNetReset','MenuIpv6','MenuLockdownOn','MenuLockdownOff',
                   'MenuMonitorInstall','MenuMonitorUninstall','MenuOpenRules',
                   'LockdownBadge','LockdownText',
-                  'MenuSaveHtml','MenuExportCsv','MenuExportLedger','MenuExportStix','MenuDigest','MenuBundle','MenuOpenReports',
+                  'MenuSaveHtml','MenuExportCsv','MenuExportLedger','MenuExportStix','MenuDigest','MenuBundle','MenuOpenReports','MenuReplaySnapshot',
                   'MenuTheme','MenuMute','MenuProcTree','MenuViewEvents','MenuClearEvents','MenuSettings',
                   'RescanButton','OpenReportsButton','FixButton',
                   'KillSwitchPanel','KillSwitchArmHost','KillSwitchRevertHost','KillSwitchArmBtn','KillSwitchRevertBtn','KillSwitchRevertSubtext',
@@ -9786,10 +9793,16 @@ $script:State = [pscustomobject]@{
     VulnDriverJob    = $null
     # GeoIP database fetch job (DB-IP Lite country CSV).
     GeoIpJob         = $null
+    # Auto-trigger state (Settings.AutoTriggerOnRetrans). Sustain counter is in heavy-ticks (2s each).
+    AutoTriggerSustainCount = 0
+    LastAutoTriggerAt       = $null
+    # DNS sinkhole job (StevenBlack-style blocklist).
+    SinkholeJob             = $null
     # Auto-refresh scheduling (set by init, decremented by Tick). DateTime values.
     NextThreatIntelRefreshAt = $null
     NextVulnDriverRefreshAt  = $null
     NextGeoIpRefreshAt       = $null
+    NextSinkholeRefreshAt    = $null
     NextScheduledScanAt      = $null
     LastScheduledDigestAt    = $null
 
@@ -11260,6 +11273,15 @@ function Update-Findings {
             } catch {
                 try { Add-Event warn ("Auto-fix workflow error: $($_.Exception.Message)") } catch {}
             }
+            # Snapshot save - every scan persists its full state for the Replay feature.
+            try {
+                $snapPath = Save-ScanSnapshot
+                if ($snapPath) {
+                    Add-Event info ("Snapshot saved: {0} (Diagnose menu -> Replay snapshot...)" -f (Split-Path $snapPath -Leaf))
+                }
+            } catch {
+                try { Add-Event warn ("Snapshot save failed: $($_.Exception.Message)") } catch {}
+            }
             # Scheduled-scan digest writer. _PendingScheduledDigest is latched by the Tick scheduler
             # right before it dispatches Update-Findings; we clear it here regardless of success so
             # a write failure doesn't loop.
@@ -11324,6 +11346,36 @@ $script:ProcScanScript = {
         [void]$byPid[$k].Udp.Add($c)
     }
 
+    # EDR-style parent-chain map: Win32_Process gives ProcessId + ParentProcessId + Name in one
+    # CIM call. We build a pid -> {Name, ParentPid, User, Domain} dictionary so the per-process
+    # ancestry walk below is O(depth) without further CIM queries.
+    $pidMap = @{}
+    try {
+        $allProc = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+        foreach ($wp in $allProc) {
+            $pidMap[[int]$wp.ProcessId] = @{
+                Name      = [string]$wp.Name
+                ParentPid = [int]$wp.ParentProcessId
+            }
+        }
+    } catch {}
+    function _Walk-Ancestry { param([int]$Pid, $Map)
+        $chain = New-Object System.Collections.ArrayList
+        $cur = $Pid
+        $depth = 0
+        $seen = @{}
+        while ($cur -gt 0 -and $depth -lt 6 -and $Map.ContainsKey($cur) -and -not $seen.ContainsKey($cur)) {
+            $seen[$cur] = $true
+            $e = $Map[$cur]
+            $name = $e.Name
+            if ($name -match '\.exe$') { $name = $name.Substring(0, $name.Length - 4) }
+            [void]$chain.Add("$name($cur)")
+            $cur = [int]$e.ParentPid
+            $depth++
+        }
+        return ($chain.ToArray())
+    }
+
     $sigCache = @{}
     $results = New-Object System.Collections.ArrayList
     foreach ($pidKey in $byPid.Keys) {
@@ -11373,18 +11425,47 @@ $script:ProcScanScript = {
         $remoteSummary = if ($remotes) { 'Remote: ' + ($remotes -join ', ') + $(if ($extConns.Count -gt 4) { " (+$($extConns.Count - 4) more)" } else { '' }) } else { 'No external connections' }
         $primaryIp = if ($extConns.Count -gt 0) { [string]$extConns[0].RemoteAddress } else { '' }
 
+        # Ancestry: walk up the parent chain. Shows as "explorer(1) -> svchost(820) -> ..."
+        # Reverse so the OLDEST ancestor is on the left (most-natural reading order).
+        $ancestryChain = @()
+        try {
+            $a = _Walk-Ancestry -Pid ([int]$pidKey) -Map $pidMap
+            if ($a -and $a.Count -gt 1) {
+                [array]::Reverse($a)
+                $ancestryChain = $a
+            }
+        } catch {}
+        $ancestryStr = if ($ancestryChain.Count -gt 0) { ($ancestryChain -join ' -> ') } else { '' }
+        $parentName = if ($ancestryChain.Count -ge 2) { $ancestryChain[$ancestryChain.Count - 2] } else { '(none)' }
+
+        # Suspicion chain heuristic: a process whose parent looks normal (explorer, services) is
+        # less suspicious than one whose parent is cmd/powershell/wscript/cscript spawned via a
+        # script-host pattern. Add a "ChainRisk" flag for the UI to highlight.
+        $chainRisk = $false
+        try {
+            $lower = $ancestryStr.ToLower()
+            if ($lower -match '(cmd|powershell|wscript|cscript|mshta|rundll32)\(.*?->.*?(curl|wget|certutil|bitsadmin|powershell|nc|netcat|cscript)') {
+                $chainRisk = $true
+            }
+        } catch {}
+
         [void]$results.Add([pscustomobject]@{
-            Risk          = $risk
-            RiskHex       = $riskHex
-            Name          = $p.ProcessName
-            Pid           = [int]$pidKey
-            PidLabel      = "(pid $pidKey)"
-            ConnLabel     = "$($byPid[$pidKey].Tcp.Count) TCP / $($byPid[$pidKey].Udp.Count) UDP"
-            Path          = if ($path) { $path } else { '(path unavailable)' }
-            RemoteSummary = $remoteSummary
+            Risk            = $risk
+            RiskHex         = $riskHex
+            Name            = $p.ProcessName
+            Pid             = [int]$pidKey
+            PidLabel        = "(pid $pidKey)"
+            ConnLabel       = "$($byPid[$pidKey].Tcp.Count) TCP / $($byPid[$pidKey].Udp.Count) UDP"
+            Path            = if ($path) { $path } else { '(path unavailable)' }
+            RemoteSummary   = $remoteSummary
             PrimaryRemoteIp = $primaryIp
-            SignerLabel   = $signer
-            SignerHex     = $signerHex
+            SignerLabel     = $signer
+            SignerHex       = $signerHex
+            ParentName      = $parentName
+            Ancestry        = $ancestryStr
+            AncestryVisibility = if ($ancestryStr) { 'Visible' } else { 'Collapsed' }
+            ChainRisk       = $chainRisk
+            ChainRiskColor  = if ($chainRisk) { '#f85149' } else { '#8b95a8' }
         })
     }
 
@@ -13372,43 +13453,351 @@ function Sample-Beacons {
     } catch {}
 }
 
+# ---------- Replay mode: snapshot save / load ----------
+# At the end of every scan we serialize the full findings + causes + counter histories to
+# Reports\Snapshots\snapshot-{stamp}.json. The Replay menu lets the user pick any snapshot and
+# re-load it into the UI - findings are tagged with [REPLAY] and the Retransmit Investigator
+# can be re-opened against the snapshotted retrans series. Useful for testing fix recommendations
+# against historical scans without having to recreate the conditions that produced them.
+$script:SnapshotsDir = Join-Path $PSScriptRoot 'Reports\Snapshots'
+if (-not (Test-Path $script:SnapshotsDir)) { New-Item -ItemType Directory -Path $script:SnapshotsDir -Force | Out-Null }
+$script:ReplayActive = $false   # latched while a replay is loaded; UI shows a banner
+
+function Save-ScanSnapshot {
+    # Called from Update-Findings' finally block. Best-effort - never throws back to caller.
+    try {
+        $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+        $path  = Join-Path $script:SnapshotsDir ("snapshot-$stamp.json")
+        $a = $script:State.Adapter
+        $payload = [ordered]@{
+            schemaVersion = 1
+            timestamp     = (Get-Date).ToString('o')
+            host          = $env:COMPUTERNAME
+            adapter       = if ($a) { @{ name=[string]$a.Name; status=[string]$a.Status; linkSpeed=[string]$a.LinkSpeed; description=[string]$a.InterfaceDescription } } else { $null }
+            findings      = @($script:AllFindings | Select-Object Level, Category, Message, Fix, Detail, MitreId, MitreName)
+            causes        = @($script:Causes | Select-Object Cause, ConfidenceLabel, Confidence, Evidence, Recommendation)
+            retransHistory = @($script:State.RetransHistory)
+            rxErrHistory   = @($script:State.RxErrHistory)
+            cpuMaxHistory  = @($script:State.CpuMaxHistory)
+            memoryHistory  = @($script:State.MemoryHistory)
+            flapCount      = $script:State.FlapCount
+            sessionStart   = $script:State.SessionStart.ToString('o')
+        }
+        $payload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $path -Encoding UTF8
+        # Keep only last 30 snapshots so the dir doesn't grow forever.
+        $old = @(Get-ChildItem $script:SnapshotsDir -Filter 'snapshot-*.json' | Sort-Object LastWriteTime -Descending | Select-Object -Skip 30)
+        foreach ($f in $old) { try { Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue } catch {} }
+        return $path
+    } catch {
+        try { Add-Event warn ("Snapshot save failed: $($_.Exception.Message)") } catch {}
+        return $null
+    }
+}
+
+function Load-ScanSnapshot {
+    # Loads a snapshot JSON into the live UI. Findings get prefixed with [REPLAY] and the page
+    # title gets a banner so the user can't confuse replayed data with a real current scan.
+    param([Parameter(Mandatory)] [string]$Path)
+    if (-not (Test-Path $Path)) { Add-Event warn "Replay: snapshot not found at $Path"; return $false }
+    try {
+        $snap = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    } catch { Add-Event warn ("Replay: snapshot parse failed: $($_.Exception.Message)"); return $false }
+    try {
+        $script:AllFindings.Clear()
+        foreach ($f in @($snap.findings)) {
+            $color = switch ([string]$f.Level) { 'FAIL' {'#f85149'} 'WARN' {'#d29922'} 'INFO' {'#58a6ff'} default {'#3fb950'} }
+            $ghost = [pscustomobject]@{
+                Level           = [string]$f.Level
+                Category        = "[REPLAY] $([string]$f.Category)"
+                Message         = [string]$f.Message
+                Fix             = [string]$f.Fix
+                Detail          = [string]$f.Detail
+                Tip             = "Replayed finding from snapshot $(Split-Path $Path -Leaf)"
+                LevelColor      = (B $color)
+                FixVisibility   = if ($f.Fix) { 'Visible' } else { 'Collapsed' }
+                MitreId         = [string]$f.MitreId
+                MitreName       = [string]$f.MitreName
+                MitreVisibility = if ($f.MitreId) { 'Visible' } else { 'Collapsed' }
+                IsNew           = $false
+                NewVisibility   = 'Collapsed'
+            }
+            [void]$script:AllFindings.Add($ghost)
+        }
+        # Restore causes for the TOP CAUSES card.
+        if ($snap.causes -and $script:Causes) {
+            $script:Causes.Clear()
+            foreach ($c in @($snap.causes)) {
+                [void]$script:Causes.Add([pscustomobject]@{
+                    Cause           = "[REPLAY] $([string]$c.Cause)"
+                    ConfidenceLabel = [string]$c.ConfidenceLabel
+                    Confidence      = [int]$c.Confidence
+                    Evidence        = [string]$c.Evidence
+                    Recommendation  = [string]$c.Recommendation
+                })
+            }
+        }
+        $script:ReplayActive = $true
+        Apply-FindingsFilter
+        $tsLabel = if ($snap.timestamp) { ([datetime]$snap.timestamp).ToString('yyyy-MM-dd HH:mm:ss') } else { '?' }
+        Add-Event info ("REPLAY loaded: {0} findings from snapshot taken at {1}." -f @($snap.findings).Count, $tsLabel)
+        if ($controls.ScanStatus) {
+            $controls.ScanStatus.Text = ("REPLAY: {0}  (re-scan to clear)" -f (Split-Path $Path -Leaf))
+            $controls.ScanStatus.Foreground = (B '#bf6dff')
+        }
+        return $true
+    } catch {
+        Add-Event warn ("Replay load failed: $($_.Exception.Message)")
+        return $false
+    }
+}
+
+function Show-ReplaySnapshotDialog {
+    # Modeless file picker rooted at Reports\Snapshots. Returns the chosen path or empty string.
+    Add-Type -AssemblyName System.Windows.Forms
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.InitialDirectory = $script:SnapshotsDir
+    $dlg.Filter           = 'NetJump snapshot (*.json)|snapshot-*.json|All files (*.*)|*.*'
+    $dlg.Title            = 'Replay snapshot'
+    if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        Load-ScanSnapshot -Path $dlg.FileName | Out-Null
+    }
+}
+
+# ---------- DNS sinkhole (hosts-file blocklist subscription) ----------
+# Subscribes to a public hosts-format blocklist (default: StevenBlack/hosts unified) and maintains
+# a NetJump-managed section in the system hosts file. Resolves blocked domains to 0.0.0.0 so the
+# browser/process can't reach them. Reversible (Clear-DnsSinkhole strips the managed section);
+# every modification is preceded by a timestamped backup under Reports\Sinkhole\.
+$script:HostsSinkholePath  = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+$script:SinkholeDir        = Join-Path $PSScriptRoot 'Reports\Sinkhole'
+$script:SinkholeDefaultUrl = 'https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts'
+$script:SinkholeBeginMark  = '# === NetJump DNS sinkhole BEGIN (auto-managed; do not edit) ==='
+$script:SinkholeEndMark    = '# === NetJump DNS sinkhole END ==='
+if (-not (Test-Path $script:SinkholeDir)) { New-Item -ItemType Directory -Path $script:SinkholeDir -Force | Out-Null }
+
+function Get-DnsSinkholeStatus {
+    # Returns @{Active=bool;Entries=int;UpdatedAt=string;Url=string;Backup=string} based on current hosts file.
+    $result = @{ Active=$false; Entries=0; UpdatedAt=$null; Url=$null; Backup=$null }
+    if (-not (Test-Path $script:HostsSinkholePath)) { return $result }
+    try {
+        $content = Get-Content -LiteralPath $script:HostsSinkholePath -Raw -ErrorAction Stop
+        if ($content -notmatch [regex]::Escape($script:SinkholeBeginMark)) { return $result }
+        $result.Active = $true
+        if ($content -match '(?ms)' + [regex]::Escape($script:SinkholeBeginMark) + '(.*?)' + [regex]::Escape($script:SinkholeEndMark)) {
+            $block = $matches[1]
+            if ($block -match 'Last updated:\s*(.+)') { $result.UpdatedAt = $matches[1].Trim() }
+            if ($block -match 'Source:\s*(.+)')       { $result.Url = $matches[1].Trim() }
+            $result.Entries = @($block -split "`n" | Where-Object { $_ -match '^\s*0\.0\.0\.0\s+\S+' }).Count
+        }
+        $latest = Get-ChildItem $script:SinkholeDir -Filter 'hosts-backup-*' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($latest) { $result.Backup = $latest.FullName }
+    } catch {}
+    return $result
+}
+
+function _Backup-HostsFile {
+    try {
+        $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+        $dest  = Join-Path $script:SinkholeDir ("hosts-backup-$stamp")
+        Copy-Item -LiteralPath $script:HostsSinkholePath -Destination $dest -Force -ErrorAction Stop
+        # Keep only the 10 most-recent backups so the dir doesn't grow forever.
+        $old = @(Get-ChildItem $script:SinkholeDir -Filter 'hosts-backup-*' | Sort-Object LastWriteTime -Descending | Select-Object -Skip 10)
+        foreach ($f in $old) { try { Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue } catch {} }
+        return $dest
+    } catch { return $null }
+}
+
+function _Write-HostsAtomic {
+    # Write the new hosts file atomically: write next to it, then Move-Item to overwrite. Verify
+    # the new file has the canonical "127.0.0.1 localhost" entry before committing - protects
+    # against catastrophic empty-hosts-file outcomes.
+    param([Parameter(Mandatory)] [string]$Content)
+    if ($Content -notmatch '127\.0\.0\.1\s+localhost') {
+        throw 'New hosts content missing 127.0.0.1 localhost - refusing to write (would break local DNS).'
+    }
+    $tmp = "$($script:HostsSinkholePath).netjump-tmp"
+    Set-Content -LiteralPath $tmp -Value $Content -Encoding ASCII -ErrorAction Stop -Force
+    Move-Item -LiteralPath $tmp -Destination $script:HostsSinkholePath -Force -ErrorAction Stop
+    # Defender Real-Time Protection may briefly lock hosts after the move; flush the DNS cache so
+    # the new blocks take effect immediately.
+    try { & ipconfig /flushdns | Out-Null } catch {}
+}
+
+function Update-DnsSinkhole {
+    # Async fetch + write. Requires admin (hosts file is owned by SYSTEM with restricted ACL).
+    if (-not $script:IsAdmin) {
+        Add-Event warn 'DNS sinkhole update requires Administrator. Re-launch via Run-NetJump.bat.'
+        return
+    }
+    if ($script:State.SinkholeJob) {
+        Add-Event scan 'DNS sinkhole update already in progress.'
+        return
+    }
+    $url = if ($script:State.Settings.DnsSinkholeUrl) { [string]$script:State.Settings.DnsSinkholeUrl } else { $script:SinkholeDefaultUrl }
+    Add-Event scan ("DNS sinkhole: fetching blocklist from {0}..." -f $url)
+    $job = Start-Job -Name 'NetJump-Sinkhole' -ScriptBlock {
+        param($Url)
+        try {
+            $r = Invoke-WebRequest -Uri $Url -TimeoutSec 60 -UseBasicParsing -ErrorAction Stop
+            # Parse hosts-format lines: "0.0.0.0 domain.com" or "127.0.0.1 domain.com".
+            # Strip comments, blank lines, and the standard localhost entries that the source
+            # files usually include.
+            $domains = New-Object System.Collections.Generic.HashSet[string]
+            $skip = @('localhost','localhost.localdomain','local','broadcasthost','ip6-localhost','ip6-loopback','ip6-localnet','ip6-mcastprefix','ip6-allnodes','ip6-allrouters','ip6-allhosts')
+            foreach ($line in ($r.Content -split "`r?`n")) {
+                $l = $line.Trim()
+                if (-not $l -or $l.StartsWith('#')) { continue }
+                if ($l -match '^(0\.0\.0\.0|127\.0\.0\.1)\s+(\S+)') {
+                    $dom = $matches[2].ToLower()
+                    if ($skip -contains $dom) { continue }
+                    if ($dom -match '^[a-z0-9\.\-]+$' -and $dom.Length -le 253) {
+                        [void]$domains.Add($dom)
+                    }
+                }
+            }
+            return @{ Ok=$true; Count=$domains.Count; Domains=([string[]]$domains); Url=$Url }
+        } catch {
+            return @{ Ok=$false; Error="$_" }
+        }
+    } -ArgumentList $url
+    $script:State.SinkholeJob = $job
+}
+
+function Apply-DnsSinkhole {
+    # Called from Tick when the SinkholeJob finishes. Writes the new managed section.
+    param([Parameter(Mandatory)] $JobResult)
+    if (-not $JobResult.Ok) {
+        Add-Event warn ("DNS sinkhole fetch failed: $($JobResult.Error)")
+        return
+    }
+    if (-not $JobResult.Domains -or $JobResult.Domains.Count -eq 0) {
+        Add-Event warn 'DNS sinkhole: blocklist parsed but contained zero usable domains. Aborting write.'
+        return
+    }
+    try {
+        $existing = Get-Content -LiteralPath $script:HostsSinkholePath -Raw -ErrorAction Stop
+    } catch {
+        Add-Event warn ("DNS sinkhole: cannot read hosts file: $($_.Exception.Message)")
+        return
+    }
+    # Strip any prior NetJump-managed section before appending the fresh one.
+    $stripped = $existing
+    $pattern = '(?ms)' + [regex]::Escape($script:SinkholeBeginMark) + '.*?' + [regex]::Escape($script:SinkholeEndMark) + '\s*'
+    $stripped = [regex]::Replace($stripped, $pattern, '')
+    if (-not $stripped.EndsWith("`r`n") -and -not $stripped.EndsWith("`n")) { $stripped += "`r`n" }
+    # Build new managed section.
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine($script:SinkholeBeginMark)
+    [void]$sb.AppendLine(("# Last updated: {0}" -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')))
+    [void]$sb.AppendLine(("# Source: {0}" -f $JobResult.Url))
+    [void]$sb.AppendLine(("# Entries: {0}" -f $JobResult.Count))
+    foreach ($d in $JobResult.Domains) { [void]$sb.AppendLine("0.0.0.0 $d") }
+    [void]$sb.AppendLine($script:SinkholeEndMark)
+    $newContent = $stripped + $sb.ToString()
+    # Backup first, then atomic write.
+    $backup = _Backup-HostsFile
+    try {
+        _Write-HostsAtomic -Content $newContent
+        $backupLeaf = if ($backup) { Split-Path $backup -Leaf } else { 'n/a' }
+        Add-Event recovery ("DNS sinkhole applied: {0} domains blocked. Backup: {1}" -f $JobResult.Count, $backupLeaf)
+    } catch {
+        Add-Event warn ("DNS sinkhole write failed: $($_.Exception.Message). Backup at: $backup")
+    }
+}
+
+function Clear-DnsSinkhole {
+    if (-not $script:IsAdmin) { Add-Event warn 'Clearing DNS sinkhole requires Administrator.'; return }
+    try {
+        $existing = Get-Content -LiteralPath $script:HostsSinkholePath -Raw -ErrorAction Stop
+    } catch { Add-Event warn ("DNS sinkhole clear: cannot read hosts: $($_.Exception.Message)"); return }
+    if ($existing -notmatch [regex]::Escape($script:SinkholeBeginMark)) {
+        Add-Event info 'DNS sinkhole: no managed section present, nothing to clear.'
+        return
+    }
+    $pattern = '(?ms)' + [regex]::Escape($script:SinkholeBeginMark) + '.*?' + [regex]::Escape($script:SinkholeEndMark) + '\s*'
+    $cleaned = [regex]::Replace($existing, $pattern, '')
+    $backup = _Backup-HostsFile
+    try {
+        _Write-HostsAtomic -Content $cleaned
+        $backupLeaf = if ($backup) { Split-Path $backup -Leaf } else { 'n/a' }
+        Add-Event recovery ("DNS sinkhole cleared. Backup: {0}" -f $backupLeaf)
+    } catch { Add-Event warn ("DNS sinkhole clear failed: $($_.Exception.Message)") }
+}
+
 function Detect-Beacons {
-    # returns array of {Key, Pid, ProcessName, IP, Port, Period, Jitter, Samples}
+    # Returns @[{Key, Pid, ProcessName, IP, Port, Period, Jitter, Samples, CV, MADRatio, AutoCorr1, Detection}].
+    # Three orthogonal detectors are run; a beacon is flagged when ANY of them triggers.
+    #   1. CV-based  (original):   stddev/mean < 0.25  - catches CLOCKWORK beacons.
+    #   2. MAD-based (jitter-tol): MAD/median < 0.4 with >=8 samples  - catches BEACONS WITH JITTER
+    #      (Cobalt Strike / Sliver style: 30s base interval +/- 20% randomized).
+    #   3. AutoCorr1 (consistency): lag-1 autocorrelation of intervals > 0.5 with >=10 samples -
+    #      catches beacons where the period is consistent even if individual gaps vary.
+    # The Detection field carries which method(s) fired so the user can interpret confidence.
     $hits = New-Object System.Collections.ArrayList
     foreach ($k in $script:BeaconSamples.Keys) {
         $list = $script:BeaconSamples[$k]
         if ($list.Count -lt 5) { continue }
-        # compute inter-arrival times
+        # Inter-arrival times in seconds.
         $intervals = New-Object System.Collections.Generic.List[double]
         for ($i = 1; $i -lt $list.Count; $i++) { [void]$intervals.Add(([double]($list[$i] - $list[$i-1]).TotalSeconds)) }
+        $n = $intervals.Count
         $mean = ($intervals | Measure-Object -Average).Average
-        if ($mean -lt 5) { continue }   # too fast to be a beacon (legitimate streaming)
-        if ($mean -gt 1800) { continue } # too slow, won't accumulate enough evidence
-        # standard deviation
+        if ($mean -lt 5)    { continue }   # too fast to be a beacon (likely legitimate streaming)
+        if ($mean -gt 1800) { continue }   # too slow, won't accumulate enough evidence
+
+        # Detector 1: CV (stddev / mean)
         $variance = 0.0
         foreach ($v in $intervals) { $variance += ($v - $mean) * ($v - $mean) }
-        $stddev = [Math]::Sqrt($variance / $intervals.Count)
+        $stddev = [Math]::Sqrt($variance / $n)
         $cv = if ($mean -gt 0) { $stddev / $mean } else { 1 }
-        if ($cv -lt 0.25) {
-            # low-jitter periodic = suspected beacon
-            $parts = $k -split '\|'
-            $procName = '?'
-            try {
-                $p = Get-Process -Id ([int]$parts[0]) -ErrorAction SilentlyContinue
-                if ($p) { $procName = $p.ProcessName }
-            } catch {}
-            [void]$hits.Add([pscustomobject]@{
-                Key       = $k
-                Pid       = [int]$parts[0]
-                ProcessName = $procName
-                IP        = $parts[1]
-                Port      = [int]$parts[2]
-                Period    = [int]$mean
-                Jitter    = [int]$stddev
-                Samples   = $list.Count
-                CV        = $cv
-            })
+
+        # Detector 2: MAD / median (robust to outliers; catches jittered beacons that defeat CV)
+        $sorted = @($intervals | Sort-Object)
+        $median = if ($n % 2) { $sorted[[int](($n - 1) / 2)] } else { ($sorted[[int](($n / 2) - 1)] + $sorted[[int]($n / 2)]) / 2.0 }
+        $abs = New-Object System.Collections.Generic.List[double]
+        foreach ($v in $intervals) { [void]$abs.Add([Math]::Abs($v - $median)) }
+        $absSorted = @($abs | Sort-Object)
+        $mad = if ($n % 2) { $absSorted[[int](($n - 1) / 2)] } else { ($absSorted[[int](($n / 2) - 1)] + $absSorted[[int]($n / 2)]) / 2.0 }
+        $madRatio = if ($median -gt 0) { $mad / $median } else { 1 }
+
+        # Detector 3: lag-1 autocorrelation of the interval series
+        $autoCorr1 = 0.0
+        if ($n -ge 10) {
+            $num = 0.0; $den = 0.0
+            for ($i = 0; $i -lt $n; $i++) {
+                $d = $intervals[$i] - $mean
+                $den += $d * $d
+                if ($i -gt 0) { $num += ($intervals[$i] - $mean) * ($intervals[$i-1] - $mean) }
+            }
+            if ($den -gt 0) { $autoCorr1 = $num / $den }
         }
+
+        $fired = @()
+        if ($cv -lt 0.25)                              { $fired += 'CV' }
+        if ($n -ge 8  -and $madRatio  -lt 0.4)         { $fired += 'MAD' }
+        if ($n -ge 10 -and $autoCorr1 -gt 0.5)         { $fired += 'AutoCorr' }
+        if ($fired.Count -eq 0) { continue }
+
+        $parts = $k -split '\|'
+        $procName = '?'
+        try {
+            $p = Get-Process -Id ([int]$parts[0]) -ErrorAction SilentlyContinue
+            if ($p) { $procName = $p.ProcessName }
+        } catch {}
+        [void]$hits.Add([pscustomobject]@{
+            Key         = $k
+            Pid         = [int]$parts[0]
+            ProcessName = $procName
+            IP          = $parts[1]
+            Port        = [int]$parts[2]
+            Period      = [int]$mean
+            Jitter      = [int]$stddev
+            Samples     = $list.Count
+            CV          = [Math]::Round($cv, 3)
+            MADRatio    = [Math]::Round($madRatio, 3)
+            AutoCorr1   = [Math]::Round($autoCorr1, 3)
+            Detection   = ($fired -join '+')
+        })
     }
     return $hits
 }
@@ -15714,6 +16103,40 @@ function Tick-RetransCpuMemory {
     $script:State.RetransHistory.Add([double]$retrans)
     if ($script:State.RetransHistory.Count -gt 60) { $script:State.RetransHistory.RemoveAt(0) }
 
+    # ---- Threshold-triggered auto-scan ----
+    # Opt-in via Settings.AutoTriggerOnRetrans. When the TCP retransmit rate stays above
+    # AutoTriggerRetransThreshold for AutoTriggerSustainSec seconds, fire Update-Findings and
+    # optionally open the Retransmit Investigator. Cooldown prevents re-trigger storms.
+    try {
+        $settings = $script:State.Settings
+        if ($settings -and $settings.AutoTriggerOnRetrans) {
+            $thresh    = if ($settings.AutoTriggerRetransThreshold) { [double]$settings.AutoTriggerRetransThreshold } else { 5.0 }
+            $sustain   = if ($settings.AutoTriggerSustainSec)       { [int]$settings.AutoTriggerSustainSec }         else { 60 }
+            $cooldown  = if ($settings.AutoTriggerCooldownSec)      { [int]$settings.AutoTriggerCooldownSec }        else { 300 }
+            $openInv   = if ($settings.PSObject.Properties.Name -contains 'AutoTriggerOpenInvestigator') { [bool]$settings.AutoTriggerOpenInvestigator } else { $true }
+            # Heavy-tick cadence is ~2s; convert sustain seconds to tick count.
+            $needCount = [int][Math]::Ceiling($sustain / 2.0)
+            if ([double]$retrans -ge $thresh) {
+                $script:State.AutoTriggerSustainCount = [int]$script:State.AutoTriggerSustainCount + 1
+            } else {
+                $script:State.AutoTriggerSustainCount = 0
+            }
+            $cooledDown = $true
+            if ($script:State.LastAutoTriggerAt) {
+                $cooledDown = (((Get-Date) - $script:State.LastAutoTriggerAt).TotalSeconds -ge $cooldown)
+            }
+            if ($script:State.AutoTriggerSustainCount -ge $needCount -and $cooledDown -and -not $script:_ScanInProgress) {
+                $script:State.LastAutoTriggerAt = Get-Date
+                $script:State.AutoTriggerSustainCount = 0
+                Add-Event warn ("Retrans threshold sustained ({0}/s for {1}s) - auto-firing scan." -f $retrans, $sustain)
+                try { $window.Dispatcher.InvokeAsync({ Update-Findings }) | Out-Null } catch {}
+                if ($openInv) {
+                    try { $window.Dispatcher.InvokeAsync({ Show-RetransInvestigatorDialog }) | Out-Null } catch {}
+                }
+            }
+        }
+    } catch { try { Add-Event warn ("Auto-trigger error: $($_.Exception.Message)") } catch {} }
+
     # Tier 32: also sample the RATIO (% of segments retransmitted vs sent in this window).
     # Ratio is the honest metric - 5/s on a busy 5000/s flow is fine; 5/s on 50/s is broken.
     $ratioSample = Sample-RetransRatio
@@ -16452,6 +16875,17 @@ function Tick {
         foreach ($p in $stillPending) { $script:State.PendingDossiers.Add($p) }
     }
 
+    # ---- DNS sinkhole job poll ----
+    if ($script:State.SinkholeJob -and $script:State.SinkholeJob.State -in 'Completed','Failed','Stopped') {
+        try {
+            $r = Receive-Job $script:State.SinkholeJob -Keep -ErrorAction SilentlyContinue
+            if ($r -is [array]) { $r = $r | Where-Object { $_ -is [hashtable] -and $_.ContainsKey('Ok') } | Select-Object -First 1 }
+            if ($r) { Apply-DnsSinkhole -JobResult $r }
+        } catch { try { Add-Event warn ("DNS sinkhole job error: $($_.Exception.Message)") } catch {} }
+        Remove-Job $script:State.SinkholeJob -Force -ErrorAction SilentlyContinue
+        $script:State.SinkholeJob = $null
+    }
+
     # ---- GeoIP database (DB-IP Lite) job poll ----
     if ($script:State.GeoIpJob -and $script:State.GeoIpJob.State -in 'Completed','Failed','Stopped') {
         try {
@@ -16532,6 +16966,19 @@ function Tick {
             $script:State.NextGeoIpRefreshAt = $now.AddHours($hours).AddMinutes($jitterMin)
             Add-Event scan ("GeoIP DB auto-refresh firing (next in {0}h)" -f $hours)
             Update-GeoIpDatabase
+        }
+        # DNS sinkhole refresh (default weekly).
+        if ($script:State.Settings -and $script:State.Settings.DnsSinkholeEnabled -and `
+            $script:State.NextSinkholeRefreshAt -and `
+            $now -ge $script:State.NextSinkholeRefreshAt -and `
+            -not $script:State.SinkholeJob -and `
+            $script:IsAdmin) {
+            $hours = if ($script:State.Settings.DnsSinkholeRefreshHours) { [int]$script:State.Settings.DnsSinkholeRefreshHours } else { 168 }
+            if ($hours -lt 12) { $hours = 168 }
+            $jitterMin = [int](Get-Random -Minimum (-30 * $hours / 24) -Maximum (30 * $hours / 24))
+            $script:State.NextSinkholeRefreshAt = $now.AddHours($hours).AddMinutes($jitterMin)
+            Add-Event scan ("DNS sinkhole auto-refresh firing (next in {0}h)" -f $hours)
+            Update-DnsSinkhole
         }
         # ---- Scheduled re-scan ----
         # Settings.ScheduledScanEnabled toggles the feature; ScheduledScanIntervalMin (default 60)
@@ -17414,6 +17861,11 @@ $controls.MenuOpenReports.Add_Click({
     if (-not (Test-Path $reports)) { New-Item -ItemType Directory -Path $reports | Out-Null }
     Start-Process explorer.exe $reports
 })
+if ($controls.MenuReplaySnapshot) {
+    $controls.MenuReplaySnapshot.Add_Click({
+        try { Show-ReplaySnapshotDialog } catch { Add-Event warn ("Replay dialog failed: $($_.Exception.Message)") }
+    })
+}
 $controls.MenuOpenRules.Add_Click({
     if (-not (Test-Path $script:RulesDir)) { New-Item -ItemType Directory -Path $script:RulesDir | Out-Null }
     Start-Process explorer.exe $script:RulesDir
@@ -18177,6 +18629,22 @@ if (-not $script:CliMode) {
         if ($hrs -lt 24) { $hrs = 720 }
         $script:State.NextGeoIpRefreshAt = (Get-Date).AddHours($hrs)
     }
+}
+
+# DNS sinkhole lifecycle. Opt-in via Settings.DnsSinkholeEnabled. Refresh cadence in hours via
+# Settings.DnsSinkholeRefreshHours (default 168 = weekly). On launch, status is reported but the
+# managed section in hosts is NOT re-applied automatically - the user controls when to refresh
+# (via Settings dialog or the auto-refresh timer).
+if (-not $script:CliMode -and $script:State.Settings -and $script:State.Settings.DnsSinkholeEnabled) {
+    $st = Get-DnsSinkholeStatus
+    if ($st.Active) {
+        Add-Event info ("DNS sinkhole active: {0} domains blocked (updated {1})." -f $st.Entries, $st.UpdatedAt)
+    } else {
+        Add-Event info 'DNS sinkhole enabled in settings but no managed section in hosts. Will fetch on next refresh.'
+    }
+    $hrs = if ($script:State.Settings.DnsSinkholeRefreshHours) { [int]$script:State.Settings.DnsSinkholeRefreshHours } else { 168 }
+    if ($hrs -lt 12) { $hrs = 168 }
+    $script:State.NextSinkholeRefreshAt = (Get-Date).AddHours($hrs)
 }
 
 # Scheduled-scan lifecycle. Opt-in via Settings.ScheduledScanEnabled. Cadence in minutes from
