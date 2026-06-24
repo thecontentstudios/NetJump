@@ -452,6 +452,15 @@ function Get-IpLabel {
             return $r.L
         }
     }
+    # Fall back to the DB-IP Lite country DB when no cloud/CDN cluster matches. Returns just the
+    # ISO country code (e.g. "DE", "NL"); cached so subsequent lookups for the same IP are O(1).
+    try {
+        $cc = Get-IpCountry $Ip
+        if ($cc) {
+            $script:IpLabelCache[$Ip] = $cc
+            return $cc
+        }
+    } catch {}
     $script:IpLabelCache[$Ip] = $null
     return $null
 }
@@ -712,6 +721,106 @@ function Test-ThreatFeedReachable {
         $result.Error   = "$_"
     }
     return $result
+}
+
+# ---------- GeoIP (DB-IP Lite Country) ----------
+# Source: https://download.db-ip.com/free/dbip-country-lite-YYYY-MM.csv.gz (no auth, monthly).
+# Replaces the hardcoded $script:CountryCoords 40-entry table for actual country attribution.
+# IPv4 only for now; v6 lookup falls through to $null gracefully.
+$script:GeoIpDbPath        = Join-Path $script:ThreatIntelDir 'geoip-country.csv'
+$script:GeoIpFeedUrlFormat = 'https://download.db-ip.com/free/dbip-country-lite-{0}.csv.gz'
+$script:GeoIpTtlHours      = 720    # 30-day refresh; the data only changes meaningfully each month.
+$script:GeoIpRangesV4      = $null  # array of [pscustomobject]@{Lo;Hi;CC} sorted by Lo
+$script:GeoIpLoaded        = $false
+$script:GeoIpLastRefresh   = $null
+
+function Load-GeoIpDatabase {
+    $script:GeoIpRangesV4 = $null
+    $script:GeoIpLoaded   = $false
+    if (-not (Test-Path $script:GeoIpDbPath)) { return $false }
+    try {
+        $age = (Get-Date) - (Get-Item $script:GeoIpDbPath).LastWriteTime
+        # Allow up to 2x TTL before discarding - 60-day-old country data is still mostly accurate.
+        if ($age.TotalHours -gt ($script:GeoIpTtlHours * 2)) { return $false }
+        $script:GeoIpLastRefresh = (Get-Item $script:GeoIpDbPath).LastWriteTime
+        $v4 = New-Object System.Collections.Generic.List[psobject]
+        $reader = [System.IO.File]::OpenText($script:GeoIpDbPath)
+        try {
+            while ($null -ne ($line = $reader.ReadLine())) {
+                if (-not $line) { continue }
+                # CSV format: start_ip,end_ip,country_code (DB-IP Lite). No header, no quoting.
+                # IPv6 rows have ':' in the addresses - skip them (v6 lookup falls through to null).
+                if ($line.IndexOf(':') -ge 0) { continue }
+                $parts = $line -split ','
+                if ($parts.Count -lt 3) { continue }
+                $s = $parts[0]; $e = $parts[1]; $cc = $parts[2].Trim()
+                if ($s -notmatch '^(\d+)\.(\d+)\.(\d+)\.(\d+)$') { continue }
+                $lo = ([uint32]$matches[1] -shl 24) -bor ([uint32]$matches[2] -shl 16) -bor ([uint32]$matches[3] -shl 8) -bor [uint32]$matches[4]
+                if ($e -notmatch '^(\d+)\.(\d+)\.(\d+)\.(\d+)$') { continue }
+                $hi = ([uint32]$matches[1] -shl 24) -bor ([uint32]$matches[2] -shl 16) -bor ([uint32]$matches[3] -shl 8) -bor [uint32]$matches[4]
+                $v4.Add([pscustomobject]@{ Lo=$lo; Hi=$hi; CC=$cc })
+            }
+        } finally { $reader.Close() }
+        # DB-IP Lite is already sorted by start_ip; sort again defensively (cheap on already-sorted).
+        $script:GeoIpRangesV4 = @($v4 | Sort-Object Lo)
+        $script:GeoIpLoaded = $true
+        return $true
+    } catch {
+        try { Add-Event warn ("GeoIP load failed: $($_.Exception.Message)") } catch {}
+        return $false
+    }
+}
+
+function Update-GeoIpDatabase {
+    # Async fetch via Start-Job. Decompresses inline to the destination CSV.
+    if ($script:State -and $script:State.GeoIpJob) {
+        Add-Event scan 'GeoIP database update already in progress.'
+        return
+    }
+    $now = Get-Date
+    $month1 = $now.ToString('yyyy-MM')
+    $month2 = $now.AddMonths(-1).ToString('yyyy-MM')
+    Add-Event scan ("GeoIP: fetching db-ip.com country-lite ({0})..." -f $month1)
+    $url1 = $script:GeoIpFeedUrlFormat -f $month1
+    $url2 = $script:GeoIpFeedUrlFormat -f $month2
+    $dest = $script:GeoIpDbPath
+    $job = Start-Job -Name 'NetJump-GeoIp' -ScriptBlock {
+        param($Url1, $Url2, $Dest)
+        $tmp = "$Dest.gz"
+        try {
+            try { Invoke-WebRequest -Uri $Url1 -OutFile $tmp -TimeoutSec 180 -UseBasicParsing -ErrorAction Stop }
+            catch { Invoke-WebRequest -Uri $Url2 -OutFile $tmp -TimeoutSec 180 -UseBasicParsing -ErrorAction Stop }
+            $inF  = [System.IO.File]::OpenRead($tmp)
+            $gz   = New-Object System.IO.Compression.GZipStream($inF, [System.IO.Compression.CompressionMode]::Decompress)
+            $outF = [System.IO.File]::Create($Dest)
+            $gz.CopyTo($outF)
+            $outF.Close(); $gz.Close(); $inF.Close()
+            Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+            return @{ Ok=$true; SizeKB = [int]((Get-Item $Dest).Length / 1024) }
+        } catch {
+            try { Remove-Item $tmp -Force -ErrorAction SilentlyContinue } catch {}
+            return @{ Ok=$false; Error="$_" }
+        }
+    } -ArgumentList $url1, $url2, $dest
+    if ($script:State) { $script:State.GeoIpJob = $job }
+}
+
+function Get-IpCountry {
+    param([string]$Ip)
+    if (-not $Ip -or -not $script:GeoIpLoaded -or -not $script:GeoIpRangesV4) { return $null }
+    if ($Ip -notmatch '^(\d+)\.(\d+)\.(\d+)\.(\d+)$') { return $null }
+    $u = ([uint32]$matches[1] -shl 24) -bor ([uint32]$matches[2] -shl 16) -bor ([uint32]$matches[3] -shl 8) -bor [uint32]$matches[4]
+    # Binary search: find the range where Lo <= u <= Hi.
+    $lo = 0
+    $hi = $script:GeoIpRangesV4.Count - 1
+    while ($lo -le $hi) {
+        $mid = [int](($lo + $hi) / 2)
+        $r = $script:GeoIpRangesV4[$mid]
+        if ($u -lt $r.Lo)      { $hi = $mid - 1 }
+        elseif ($u -gt $r.Hi)  { $lo = $mid + 1 }
+        else                   { return $r.CC }
+    }
+    return $null
 }
 
 function Test-IpThreat {
@@ -1821,6 +1930,68 @@ function Get-PublicIpCached {
     return $null
 }
 
+# ---------- Wi-Fi metrics ----------
+# Parses `netsh wlan show interfaces` output for the connected wireless interface that matches
+# $AdapterName. Returns a hashtable with SSID/BSSID/Channel/Signal/Auth/Radio/Rx/Tx fields, or
+# $null if no matching wireless interface is connected. Cheap enough to call on the same cadence
+# as Update-LocalNetInfo (every few seconds when the sidebar is visible).
+function Get-WifiInfo {
+    param([string]$AdapterName)
+    if (-not $AdapterName) { return $null }
+    try {
+        $out = (& netsh wlan show interfaces 2>$null | Out-String)
+        if (-not $out -or $out -match 'There is no wireless interface') { return $null }
+        # Split into per-interface blocks; each block starts at a "Name : ..." line.
+        $blocks = $out -split '(?m)^\s*Name\s*:\s*'
+        $info = $null
+        foreach ($b in $blocks) {
+            if (-not $b -or $b -notmatch ':') { continue }
+            $firstLine = ($b -split '\r?\n')[0].Trim()
+            if (-not $firstLine) { continue }
+            if ($AdapterName -and $firstLine -ne $AdapterName) { continue }
+            $info = @{ Name = $firstLine }
+            $fields = @{
+                SSID    = 'SSID'
+                BSSID   = 'BSSID'
+                State   = 'State'
+                Radio   = 'Radio type'
+                Auth    = 'Authentication'
+                Cipher  = 'Cipher'
+                Channel = 'Channel'
+                Signal  = 'Signal'
+                RxMbps  = 'Receive rate \(Mbps\)'
+                TxMbps  = 'Transmit rate \(Mbps\)'
+                Profile = 'Profile'
+            }
+            foreach ($k in $fields.Keys) {
+                $pat = '(?m)^\s*' + $fields[$k] + '\s*:\s*(.+?)\s*$'
+                if ($b -match $pat) { $info[$k] = $matches[1].Trim() }
+            }
+            break
+        }
+        if ($info -and $info.Signal -and $info.Signal -match '(\d+)%') {
+            $pct = [int]$matches[1]
+            $info.SignalPct = $pct
+            # Rough dBm conversion: Microsoft maps -100 dBm => 0%, -50 dBm => 100% linearly.
+            $info.SignalDbm = [int](($pct / 2.0) - 100)
+            # 4-bar gauge for the UI
+            $info.Bars = if ($pct -ge 76) { 4 } elseif ($pct -ge 51) { 3 } elseif ($pct -ge 26) { 2 } else { 1 }
+        }
+        return $info
+    } catch { return $null }
+}
+
+# Cached because netsh wlan can take 100-300ms; refresh once per ~3 sec is plenty for the UI.
+$script:WifiCache = @{ At = [DateTime]::MinValue; Info = $null }
+function Get-WifiInfoCached {
+    param([string]$AdapterName)
+    if (((Get-Date) - $script:WifiCache.At).TotalSeconds -lt 3) { return $script:WifiCache.Info }
+    $info = Get-WifiInfo -AdapterName $AdapterName
+    $script:WifiCache.At = Get-Date
+    $script:WifiCache.Info = $info
+    return $info
+}
+
 function Update-LocalNetInfo {
     if (-not $controls -or -not $controls.LocalIpv4Text) { return }
     $a = $script:State.Adapter
@@ -1955,6 +2126,49 @@ function Update-LocalNetInfo {
     } catch {
         $controls.LocalMtuText.Text = '(error)'
         $controls.LocalMssText.Text = '--'
+    }
+
+    # ---- Wi-Fi block. Shown only when the adapter is wireless. ----
+    if ($controls.LocalWifiPanel) {
+        $isWireless = $false
+        try {
+            if ($a.PhysicalMediaType -and ($a.PhysicalMediaType -match 'Wireless|802\.11')) { $isWireless = $true }
+            elseif ($a.InterfaceType -and ($a.InterfaceType -eq 71)) { $isWireless = $true }   # 71 = IEEE 802.11
+        } catch {}
+        if ($isWireless) {
+            $wifi = Get-WifiInfoCached -AdapterName ([string]$a.Name)
+            if ($wifi) {
+                $controls.LocalWifiSsidText.Text  = if ($wifi.SSID)    { [string]$wifi.SSID }    else { '(not associated)' }
+                $controls.LocalWifiBssidText.Text = if ($wifi.BSSID)   { [string]$wifi.BSSID }   else { '--' }
+                $chParts = @()
+                if ($wifi.Channel) { $chParts += [string]$wifi.Channel }
+                if ($wifi.Radio)   { $chParts += [string]$wifi.Radio }
+                $controls.LocalWifiChanText.Text = if ($chParts.Count -gt 0) { $chParts -join ' / ' } else { '--' }
+                if ($wifi.SignalPct) {
+                    $bars = '▮' * [int]$wifi.Bars + '▯' * (4 - [int]$wifi.Bars)
+                    $controls.LocalWifiSignalText.Text = ("{0}  ({1}% / ~{2} dBm)" -f $bars, $wifi.SignalPct, $wifi.SignalDbm)
+                    # Color-code: green >=76%, amber 51-75%, red <=50%
+                    $sigColor = if ($wifi.SignalPct -ge 76) { '#3fb950' } elseif ($wifi.SignalPct -ge 51) { '#d29922' } else { '#f85149' }
+                    try { $controls.LocalWifiSignalText.Foreground = $window.Resources['BrushFgPrimary'] } catch {}
+                    try { $controls.LocalWifiSignalText.Foreground = (New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.ColorConverter]::ConvertFromString($sigColor))) } catch {}
+                } else {
+                    $controls.LocalWifiSignalText.Text = '--'
+                }
+                $authParts = @()
+                if ($wifi.Auth)   { $authParts += [string]$wifi.Auth }
+                if ($wifi.Cipher) { $authParts += [string]$wifi.Cipher }
+                $controls.LocalWifiAuthText.Text = if ($authParts.Count -gt 0) { $authParts -join ' / ' } else { '--' }
+            } else {
+                $controls.LocalWifiSsidText.Text  = '(no data - run as admin?)'
+                $controls.LocalWifiBssidText.Text = '--'
+                $controls.LocalWifiChanText.Text  = '--'
+                $controls.LocalWifiSignalText.Text= '--'
+                $controls.LocalWifiAuthText.Text  = '--'
+            }
+            $controls.LocalWifiPanel.Visibility = 'Visible'
+        } else {
+            $controls.LocalWifiPanel.Visibility = 'Collapsed'
+        }
     }
 }
 
@@ -3093,6 +3307,14 @@ $script:AllFindings     = New-Object System.Collections.Generic.List[object]   #
 $script:PrevFindingKeys = @{}                                                    # last scan keys
 $script:FilterText      = ''
 $script:HideHealthy     = $false
+# Differential-scan filter. One of: 'all' (default) | 'new' (only findings new this scan) |
+# 'resolved' (only items that disappeared since last scan, rendered as ghost entries) | 'changed'
+# (NEW + RESOLVED combined). Driven by the DiffModeCombo on the DIAGNOSTICS tab.
+$script:DiffMode        = 'all'
+# Tracks the FULL previous-scan finding objects so we can synthesize 'resolved' ghost rows.
+# Populated by Update-Findings; consumed by Apply-FindingsFilter.
+$script:PrevFindingsByKey = @{}
+$script:ResolvedFindings  = New-Object System.Collections.Generic.List[object]
 $script:SuppressedKeys  = @{}                                                    # key -> @{Mode; Expires}
 
 function Get-FindingKey {
@@ -3170,8 +3392,10 @@ function Apply-FindingsFilter {
     $muted = New-Object System.Collections.Generic.List[object]
 
     $filter = ([string]$script:FilterText).Trim().ToLower()
+    $diff   = [string]$script:DiffMode
+    if (-not $diff) { $diff = 'all' }
     # Diagnostic counters
-    $stats = @{ In=0; FilteredOut=0; Suppressed=0; FAIL=0; WARN=0; INFO=0; OK=0; OKHidden=0; OtherLevel=@() }
+    $stats = @{ In=0; FilteredOut=0; Suppressed=0; FAIL=0; WARN=0; INFO=0; OK=0; OKHidden=0; Resolved=0; DiffSkipped=0; OtherLevel=@() }
     if ($script:AllFindings) {
         foreach ($f in $script:AllFindings) {
             $stats.In++
@@ -3181,6 +3405,11 @@ function Apply-FindingsFilter {
                     ([string]$f.Category).ToLower().Contains($filter) -or ([string]$f.Message).ToLower().Contains($filter) -or ([string]$f.MitreId).ToLower().Contains($filter)
                 }
                 if (-not $passesFilter) { $stats.FilteredOut++; continue }
+                # Diff-mode filter: skip non-new entries when diff='new'; skip everything when diff='resolved'
+                # (resolved ghosts are appended separately below).
+                if ($diff -eq 'new' -and -not [bool]$f.IsNew) { $stats.DiffSkipped++; continue }
+                if ($diff -eq 'resolved') { $stats.DiffSkipped++; continue }
+                if ($diff -eq 'changed' -and -not [bool]$f.IsNew) { $stats.DiffSkipped++; continue }
                 if (Test-IsSuppressed $key) {
                     $stats.Suppressed++
                     [void]$muted.Add($f)
@@ -3200,6 +3429,19 @@ function Apply-FindingsFilter {
             } catch {
                 try { Add-Event warn ("Filter loop error on a finding: $($_.Exception.Message)") } catch {}
             }
+        }
+    }
+    # Append RESOLVED ghost rows when diff mode is 'resolved' or 'changed'. These show up in the
+    # OK bucket with green coloring and a "RESOLVED:" prefix so they're visually distinct.
+    if (($diff -eq 'resolved' -or $diff -eq 'changed') -and $script:ResolvedFindings) {
+        foreach ($r in $script:ResolvedFindings) {
+            try {
+                $msgLower = ([string]$r.Message).ToLower()
+                $catLower = ([string]$r.Category).ToLower()
+                if ($filter -and -not ($msgLower.Contains($filter) -or $catLower.Contains($filter))) { continue }
+                [void]$ok.Add($r)
+                $stats.Resolved++
+            } catch {}
         }
     }
 
@@ -3890,32 +4132,96 @@ DIAGNOSTICS tab alongside built-in findings.
 }
 
 function Invoke-CustomRules {
+    # Sandboxed custom-rule runner. Each .ps1 in $script:RulesDir is:
+    #   1. PARSE-VALIDATED in the main thread before doing anything else (a syntax error in one rule
+    #      file can no longer crash the scan).
+    #   2. RUN IN A CHILD RUNSPACE so an exception, infinite loop, or runaway Write-Host can't
+    #      damage scan state. Hard timeout: $script:CustomRuleTimeoutSec (default 5).
+    #   3. RESULT-VALIDATED for the expected schema before being adopted as findings.
+    # The script still exposes the Test-NetJumpRule contract: each rule file must export that
+    # function returning zero or more objects with {Level, Category, Message, Fix, Detail, Mitre}.
     $out = New-Object System.Collections.Generic.List[object]
     $files = Get-ChildItem -Path $script:RulesDir -Filter '*.ps1' -ErrorAction SilentlyContinue
     if (-not $files) { return $out }
+    $timeoutSec = if ($script:CustomRuleTimeoutSec) { [int]$script:CustomRuleTimeoutSec } else { 5 }
+    if ($timeoutSec -lt 1)   { $timeoutSec = 1 }
+    if ($timeoutSec -gt 60)  { $timeoutSec = 60 }
     foreach ($f in $files) {
+        # Phase 1: parse-validate. A syntax error here means the rule file is broken; surface it
+        # as a WARN finding and skip the actual execution. This is what stops "one bad rule crashes
+        # the whole scan" from being possible.
+        $parseErrors = $null
         try {
-            # dot-source defines Test-NetJumpRule in this scope; Remove-Item afterward keeps it clean
-            Remove-Item Function:\Test-NetJumpRule -ErrorAction SilentlyContinue
-            . $f.FullName
-            if (Get-Command Test-NetJumpRule -ErrorAction SilentlyContinue) {
-                $r = & Test-NetJumpRule
-                foreach ($entry in @($r)) {
-                    if (-not $entry) { continue }
-                    $level = if ($entry.PSObject.Properties['Level']) { [string]$entry.Level } else { 'INFO' }
-                    $cat   = if ($entry.PSObject.Properties['Category']) { [string]$entry.Category } else { 'CustomRule' }
-                    $msg   = if ($entry.PSObject.Properties['Message']) { [string]$entry.Message } else { 'rule fired (no message)' }
-                    $fix   = if ($entry.PSObject.Properties['Fix']) { [string]$entry.Fix } else { '' }
-                    $det   = if ($entry.PSObject.Properties['Detail']) { [string]$entry.Detail } else { ("Custom rule: {0}" -f $f.Name) }
-                    $mit   = if ($entry.PSObject.Properties['Mitre']) { [string]$entry.Mitre } else { '' }
-                    $out.Add((Add-Finding $level $cat $msg $fix $det $mit))
-                }
+            $null = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$parseErrors)
+        } catch {
+            $out.Add((Add-Finding 'WARN' 'CustomRule' ("Rule '{0}' failed to parse: {1}" -f $f.Name, $_.Exception.Message)))
+            continue
+        }
+        if ($parseErrors -and @($parseErrors).Count -gt 0) {
+            $first = @($parseErrors)[0]
+            $out.Add((Add-Finding 'WARN' 'CustomRule' ("Rule '{0}' has {1} parse error(s); first at line {2}: {3}" -f $f.Name, @($parseErrors).Count, $first.Extent.StartLineNumber, $first.Message)))
+            continue
+        }
+        # Phase 2: run in child runspace with timeout. The runspace is fresh; if a rule defines
+        # global variables, they don't leak back to the host. Output captured via Invoke-Command.
+        $rs = $null; $ps = $null; $async = $null
+        $results = $null
+        try {
+            $rs = [runspacefactory]::CreateRunspace()
+            $rs.Open()
+            $ps = [PowerShell]::Create()
+            $ps.Runspace = $rs
+            $sb = @"
+. '$($f.FullName.Replace("'","''"))'
+if (-not (Get-Command Test-NetJumpRule -ErrorAction SilentlyContinue)) {
+    throw 'Rule did not export Test-NetJumpRule.'
+}
+@(Test-NetJumpRule)
+"@
+            [void]$ps.AddScript($sb)
+            $async = $ps.BeginInvoke()
+            if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($timeoutSec))) {
+                # Timed out - kill the runspace and warn.
+                try { $ps.Stop() } catch {}
+                $out.Add((Add-Finding 'WARN' 'CustomRule' ("Rule '{0}' exceeded {1}s timeout - skipped." -f $f.Name, $timeoutSec)))
+                continue
+            }
+            $results = $ps.EndInvoke($async)
+            if ($ps.HadErrors -and $ps.Streams.Error.Count -gt 0) {
+                $errMsg = ($ps.Streams.Error | Select-Object -First 1).Exception.Message
+                $out.Add((Add-Finding 'WARN' 'CustomRule' ("Rule '{0}' threw: {1}" -f $f.Name, $errMsg)))
+                continue
             }
         } catch {
-            $out.Add((Add-Finding 'WARN' 'CustomRule' ("Rule file '{0}' raised: {1}" -f $f.Name, $_.Exception.Message)))
+            $out.Add((Add-Finding 'WARN' 'CustomRule' ("Rule '{0}' sandbox failure: {1}" -f $f.Name, $_.Exception.Message)))
+            continue
+        } finally {
+            try { if ($ps) { $ps.Dispose() } } catch {}
+            try { if ($rs) { $rs.Close(); $rs.Dispose() } } catch {}
+        }
+        # Phase 3: result-validate + adopt as findings. Each returned object must have a Level
+        # field in the legal set; the rest are best-effort.
+        $validLevels = @('OK','INFO','WARN','FAIL')
+        $adopted = 0
+        foreach ($entry in @($results)) {
+            if (-not $entry) { continue }
+            try {
+                $level = if ($entry.PSObject.Properties['Level']) { [string]$entry.Level } else { 'INFO' }
+                if ($validLevels -notcontains $level) { $level = 'INFO' }
+                $cat = if ($entry.PSObject.Properties['Category']) { [string]$entry.Category } else { 'CustomRule' }
+                $msg = if ($entry.PSObject.Properties['Message']) { [string]$entry.Message } else { 'rule fired (no message)' }
+                $fix = if ($entry.PSObject.Properties['Fix']) { [string]$entry.Fix } else { '' }
+                $det = if ($entry.PSObject.Properties['Detail']) { [string]$entry.Detail } else { ("Custom rule: {0}" -f $f.Name) }
+                $mit = if ($entry.PSObject.Properties['Mitre']) { [string]$entry.Mitre } else { '' }
+                $out.Add((Add-Finding $level $cat $msg $fix $det $mit))
+                $adopted++
+            } catch {}
+        }
+        # When the rule returned zero entries, still emit an INFO so the user can see it ran cleanly.
+        if ($adopted -eq 0) {
+            $out.Add((Add-Finding 'OK' 'CustomRule' ("Rule '{0}' ran cleanly, no findings." -f $f.Name)))
         }
     }
-    Remove-Item Function:\Test-NetJumpRule -ErrorAction SilentlyContinue
     return $out
 }
 
@@ -7438,6 +7744,38 @@ function Save-FlapDossier {
               <TextBlock Grid.Row="10" Grid.Column="1" x:Name="LocalMssText"     Text="--" Foreground="{DynamicResource BrushFgPrimary}" FontSize="11" FontFamily="Consolas" TextWrapping="Wrap" Margin="0,2,0,0" ToolTip="TCP Maximum Segment Size = MTU - 40 (IP header 20 + TCP header 20). The largest single TCP payload on this link without fragmentation."/>
             </Grid>
 
+            <!-- WIFI subgroup. Only visible when the active adapter is wireless (PhysicalMediaType
+                 matches Wireless or 802.11). Populated from `netsh wlan show interfaces` via
+                 Get-WifiInfo, refreshed on the same cadence as the rest of the sidebar. -->
+            <Border x:Name="LocalWifiPanel" Background="{DynamicResource BrushCardBg}" BorderBrush="{DynamicResource BrushBorder}" BorderThickness="1" CornerRadius="4" Padding="6,4" Margin="0,8,0,0" Visibility="Collapsed">
+              <StackPanel>
+                <TextBlock Text="WIFI" Foreground="#3fb950" FontSize="9" FontWeight="Bold" Margin="0,0,0,3"/>
+                <Grid>
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="55"/>
+                    <ColumnDefinition Width="*"/>
+                  </Grid.ColumnDefinitions>
+                  <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                  </Grid.RowDefinitions>
+                  <TextBlock Grid.Row="0" Grid.Column="0" Text="SSID"    Foreground="{DynamicResource BrushFgMuted}" FontSize="10"/>
+                  <TextBlock Grid.Row="0" Grid.Column="1" x:Name="LocalWifiSsidText"   Text="--" Foreground="{DynamicResource BrushFgPrimary}" FontSize="11" FontFamily="Consolas" TextTrimming="CharacterEllipsis" ToolTip="Connected network name"/>
+                  <TextBlock Grid.Row="1" Grid.Column="0" Text="BSSID"   Foreground="{DynamicResource BrushFgMuted}" FontSize="10" Margin="0,2,0,0"/>
+                  <TextBlock Grid.Row="1" Grid.Column="1" x:Name="LocalWifiBssidText"  Text="--" Foreground="{DynamicResource BrushFgPrimary}" FontSize="11" FontFamily="Consolas" Margin="0,2,0,0" ToolTip="Access point MAC. Changes mean you've roamed to a different AP."/>
+                  <TextBlock Grid.Row="2" Grid.Column="0" Text="Channel" Foreground="{DynamicResource BrushFgMuted}" FontSize="10" Margin="0,2,0,0"/>
+                  <TextBlock Grid.Row="2" Grid.Column="1" x:Name="LocalWifiChanText"   Text="--" Foreground="{DynamicResource BrushFgPrimary}" FontSize="11" FontFamily="Consolas" Margin="0,2,0,0" ToolTip="Channel number + 802.11 radio type (e.g., 36 / 802.11ac)"/>
+                  <TextBlock Grid.Row="3" Grid.Column="0" Text="Signal"  Foreground="{DynamicResource BrushFgMuted}" FontSize="10" Margin="0,2,0,0"/>
+                  <TextBlock Grid.Row="3" Grid.Column="1" x:Name="LocalWifiSignalText" Text="--" Foreground="{DynamicResource BrushFgPrimary}" FontSize="11" FontFamily="Consolas" Margin="0,2,0,0" ToolTip="Signal strength as percentage (rough dBm equivalent in parens). Below -75 dBm/~50% is marginal."/>
+                  <TextBlock Grid.Row="4" Grid.Column="0" Text="Auth"    Foreground="{DynamicResource BrushFgMuted}" FontSize="10" Margin="0,2,0,0"/>
+                  <TextBlock Grid.Row="4" Grid.Column="1" x:Name="LocalWifiAuthText"   Text="--" Foreground="{DynamicResource BrushFgPrimary}" FontSize="11" FontFamily="Consolas" Margin="0,2,0,0" ToolTip="Authentication + cipher. Open or WEP = unsafe; WPA3-Personal AES-CCMP = current best."/>
+                </Grid>
+              </StackPanel>
+            </Border>
+
             <!-- Reset row: 5 compact equal-width buttons side by side. Tooltips carry the full
                  explanation since the button labels are abbreviated. RESET column is red text
                  to flag it as the heavy/destructive option. -->
@@ -7799,7 +8137,16 @@ function Save-FlapDossier {
                   </Grid>
                 </Border>
                 <CheckBox Grid.Column="1" x:Name="HideHealthyCheck" Content="Hide healthy" Foreground="{DynamicResource BrushFgMuted}" FontSize="11" VerticalAlignment="Center" Margin="10,0,0,0" ToolTip="Collapse the HEALTHY bucket and hide passing-check noise"/>
-                <TextBlock Grid.Column="2" x:Name="FilterStatus" Text="" Foreground="{DynamicResource BrushFgFaint}" FontSize="10" VerticalAlignment="Center" Margin="10,0,0,0"/>
+                <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center" Margin="10,0,0,0">
+                  <TextBlock Text="Diff:" Foreground="{DynamicResource BrushFgMuted}" FontSize="11" VerticalAlignment="Center" Margin="0,0,4,0"/>
+                  <ComboBox x:Name="DiffModeCombo" Width="92" Padding="4,1" FontSize="11" VerticalAlignment="Center" ToolTip="Filter by what changed since the previous scan. NEW = appeared this scan. RESOLVED = was flagged before but is gone now. CHANGED = both.">
+                    <ComboBoxItem Content="All" IsSelected="True" Tag="all"/>
+                    <ComboBoxItem Content="NEW only"      Tag="new"/>
+                    <ComboBoxItem Content="RESOLVED only" Tag="resolved"/>
+                    <ComboBoxItem Content="Changed"       Tag="changed"/>
+                  </ComboBox>
+                  <TextBlock x:Name="FilterStatus" Text="" Foreground="{DynamicResource BrushFgFaint}" FontSize="10" VerticalAlignment="Center" Margin="10,0,0,0"/>
+                </StackPanel>
               </Grid>
 
               <!-- TIER 5: TOP CAUSES - now fills its allocated Grid.Row instead of capping at 240px.
@@ -9098,7 +9445,7 @@ foreach ($name in 'Dot','DotGlow','AdapterCombo','AdapterDesc','StatusText','Lin
                   'FindingsListFail','FindingsListWarn','FindingsListInfo','FindingsListOk','FindingsListMuted',
                   'DiagScroller','ExpFail','ExpWarn','ExpInfo','ExpOk','ExpMuted','FailCountText','WarnCountText','InfoCountText','OkCountText','MutedCountText',
                   'EmptyFail','EmptyWarn','EmptyInfo','EmptyOk',
-                  'FilterTextBox','HideHealthyCheck','FilterStatus',
+                  'FilterTextBox','HideHealthyCheck','FilterStatus','DiffModeCombo',
                   'ActivityRibbonBorder','SplitColLeft','SplitColRight','EventsCard',
                   'GatewayLabel','GwLatencyText','CfLatencyText','LossText','ChartCanvas',
                   'RxErrText','RxErrSpark','RxDiscText','RxDiscSpark','ThroughputText','ThroughputSpark',
@@ -9136,6 +9483,7 @@ foreach ($name in 'Dot','DotGlow','AdapterCombo','AdapterDesc','StatusText','Lin
                   'LocalInfoPanel','LocalInfoScroll','LocalInfoRefreshBtn','LocalInfoStatus',
                   'LocalAdapterText','LocalIpv4Text','LocalMaskText','LocalGwText','LocalMacText','LocalDnsText','LocalDhcpText','LocalLeaseText','LocalPublicIpText',
                   'LocalMtuText','LocalMssText',
+                  'LocalWifiPanel','LocalWifiSsidText','LocalWifiBssidText','LocalWifiChanText','LocalWifiSignalText','LocalWifiAuthText',
                   'LocalRenewBtn','LocalFlushDnsBtn','LocalArpFlushBtn','LocalResetIpBtn','LocalMtuBtn',
                   'TrafficStatus','TrafficPauseBtn','TrafficTotalRate','TrafficProtoText',
                   'TrafficTcpBar','TrafficUdpBar','TrafficIcmpBar',
@@ -9436,9 +9784,12 @@ $script:State = [pscustomobject]@{
     ThreatIntelLoaded = $false
     # Vulnerable-driver list (loldrivers.io) - sibling to ThreatIntel, same job-poll pattern.
     VulnDriverJob    = $null
+    # GeoIP database fetch job (DB-IP Lite country CSV).
+    GeoIpJob         = $null
     # Auto-refresh scheduling (set by init, decremented by Tick). DateTime values.
     NextThreatIntelRefreshAt = $null
     NextVulnDriverRefreshAt  = $null
+    NextGeoIpRefreshAt       = $null
     NextScheduledScanAt      = $null
     LastScheduledDigestAt    = $null
 
@@ -10712,6 +11063,7 @@ function Update-Findings {
     # Wrapped in its own try/catch so a malformed key string can never block Apply-FindingsFilter
     # below - that's what was leaving the buckets empty when this section threw.
     try {
+        $script:ResolvedFindings.Clear()
         if ($prevKeys.Count -gt 0) {
             $resolvedCount = 0
             foreach ($pk in $prevKeys.Keys) {
@@ -10724,6 +11076,29 @@ function Update-Findings {
                     # was 'Add-Event ok' which throws ParameterValidationError - 'ok' isn't in the ValidateSet.
                     # 'recovery' renders green (same intent) and is a valid type.
                     Add-Event recovery ("RESOLVED [{0}]: {1}" -f $cat, $msg)
+                    # Build a ghost finding so Apply-FindingsFilter can show it under DiffMode 'resolved'.
+                    # Pulls richer metadata from $script:PrevFindingsByKey if we have the full prior object.
+                    $prev = if ($script:PrevFindingsByKey.ContainsKey($pk)) { $script:PrevFindingsByKey[$pk] } else { $null }
+                    $ghostFix    = if ($prev) { [string]$prev.Fix }    else { '' }
+                    $ghostDetail = if ($prev) { [string]$prev.Detail } else { '' }
+                    $ghostMitre  = if ($prev) { [string]$prev.MitreId } else { '' }
+                    $ghostName   = if ($prev) { [string]$prev.MitreName } else { '' }
+                    $ghost = [pscustomobject]@{
+                        Level           = 'OK'
+                        Category        = "RESOLVED [$cat]"
+                        Message         = $msg
+                        Fix             = ''
+                        Detail          = if ($ghostDetail) { $ghostDetail } else { ("Previously flagged. No longer detected in this scan." + $(if ($ghostFix) { "  Prior fix: $ghostFix" } else { '' })) }
+                        Tip             = ("RESOLVED since last scan." + $(if ($ghostFix) { "  Prior fix: $ghostFix" } else { '' }))
+                        LevelColor      = (B '#3fb950')
+                        FixVisibility   = 'Collapsed'
+                        MitreId         = $ghostMitre
+                        MitreName       = $ghostName
+                        MitreVisibility = if ($ghostMitre) { 'Visible' } else { 'Collapsed' }
+                        IsNew           = $false
+                        NewVisibility   = 'Collapsed'
+                    }
+                    [void]$script:ResolvedFindings.Add($ghost)
                 }
             }
             if ($resolvedCount -gt 0 -and $controls.FilterStatus) {
@@ -10737,8 +11112,15 @@ function Update-Findings {
     } catch {
         try { Add-Event warn ("Resolved-detection failed: $($_.Exception.Message)") } catch {}
     }
-    # snapshot keys for next scan
+    # snapshot keys + full findings for next scan
     $script:PrevFindingKeys = $currentKeys
+    $script:PrevFindingsByKey = @{}
+    foreach ($f in $script:Findings) {
+        try {
+            $k = Get-FindingKey $f
+            if ($k) { $script:PrevFindingsByKey[$k] = $f }
+        } catch {}
+    }
 
     # rebuild the 5 buckets via filter+suppression aware function
     Apply-FindingsFilter
@@ -13670,28 +14052,137 @@ function Stop-HttpServer {
 }
 
 # ---------- Tier 8: webhook POST on flap (fire-and-forget) ----------
+# ---------- Webhook templates ----------
+# Format a generic event object into a service-specific payload. Templates supported:
+#   'generic'  - the original NetJump flat JSON. Default; use for ntfy/custom HTTP endpoints.
+#   'slack'    - Slack incoming-webhook style: { text + blocks[] with markdown sections }.
+#   'discord'  - Discord webhook style: { content + embeds[] with colored side bar and fields }.
+#   'ntfy'     - ntfy.sh style: plain-text body + X-Title/X-Priority/X-Tags headers.
+# Returns @{Body; ContentType; ExtraHeaders}. Caller is responsible for the POST.
+function Format-WebhookPayload {
+    param(
+        [Parameter(Mandatory)] [string]$Template,
+        [Parameter(Mandatory)] $Event
+    )
+    $title    = [string]$Event.Title
+    $body     = [string]$Event.Body
+    $severity = if ($Event.Severity) { [string]$Event.Severity } else { 'info' }
+    $fields   = if ($Event.Fields) { $Event.Fields } else { @{} }
+    switch ($Template.ToLower()) {
+        'slack' {
+            $sevEmoji = switch ($severity) { 'critical' { ':rotating_light:' } 'warn' { ':warning:' } 'recovery' { ':white_check_mark:' } default { ':information_source:' } }
+            $fieldLines = @()
+            foreach ($k in $fields.Keys) { $fieldLines += ("*{0}:* {1}" -f $k, [string]$fields[$k]) }
+            $blockText = "$sevEmoji *$title*"
+            if ($body)                  { $blockText += "`n$body" }
+            if ($fieldLines.Count -gt 0){ $blockText += "`n" + ($fieldLines -join "`n") }
+            $payload = @{
+                text   = ("{0} {1}" -f $sevEmoji, $title)
+                blocks = @(
+                    @{ type='section'; text=@{ type='mrkdwn'; text=$blockText } }
+                )
+            }
+            return @{ Body = ($payload | ConvertTo-Json -Depth 6 -Compress); ContentType = 'application/json'; ExtraHeaders = @{} }
+        }
+        'discord' {
+            # Discord color is decimal RGB: red=15158332, amber=16028726, green=3066993, blue=3447003
+            $color = switch ($severity) { 'critical' { 15158332 } 'warn' { 16028726 } 'recovery' { 3066993 } default { 3447003 } }
+            $efields = @()
+            foreach ($k in $fields.Keys) { $efields += @{ name = [string]$k; value = [string]$fields[$k]; inline = $true } }
+            $payload = @{
+                username = 'NetJump'
+                embeds   = @(
+                    @{
+                        title       = $title
+                        description = $body
+                        color       = $color
+                        fields      = $efields
+                        timestamp   = (Get-Date).ToUniversalTime().ToString('o')
+                    }
+                )
+            }
+            return @{ Body = ($payload | ConvertTo-Json -Depth 6 -Compress); ContentType = 'application/json'; ExtraHeaders = @{} }
+        }
+        'ntfy' {
+            # ntfy carries metadata in HTTP headers, not in the body. The body is plain text only.
+            $bodyText = $body
+            if ($fields.Count -gt 0) {
+                $lines = @($fields.GetEnumerator() | ForEach-Object { "{0}: {1}" -f $_.Key, $_.Value })
+                if ($bodyText) { $bodyText = $bodyText + "`n`n" + ($lines -join "`n") }
+                else { $bodyText = $lines -join "`n" }
+            }
+            $tags = switch ($severity) { 'critical' { 'rotating_light' } 'warn' { 'warning' } 'recovery' { 'white_check_mark' } default { 'information_source' } }
+            $prio = switch ($severity) { 'critical' { '5' } 'warn' { '4' } 'recovery' { '2' } default { '3' } }
+            return @{
+                Body         = $bodyText
+                ContentType  = 'text/plain; charset=utf-8'
+                ExtraHeaders = @{
+                    'Title'    = $title
+                    'Priority' = $prio
+                    'Tags'     = $tags
+                }
+            }
+        }
+        default {
+            # 'generic' - flat JSON shape, backward compatible with anything pre-existing.
+            $payload = @{
+                type      = if ($Event.Type) { [string]$Event.Type } else { 'event' }
+                title     = $title
+                body      = $body
+                severity  = $severity
+                host      = $env:COMPUTERNAME
+                timestamp = (Get-Date).ToString('o')
+            }
+            foreach ($k in $fields.Keys) { $payload[$k] = $fields[$k] }
+            return @{ Body = ($payload | ConvertTo-Json -Depth 6 -Compress); ContentType = 'application/json'; ExtraHeaders = @{} }
+        }
+    }
+}
+
+function Send-WebhookEvent {
+    # High-level webhook fire-and-forget. Reads url + template from settings, formats the event,
+    # POSTs in a background job so caller never blocks. Use this instead of hand-rolling per-event
+    # webhook callers; pass an event hashtable with Title / Body / Severity / Type / Fields.
+    param([Parameter(Mandatory)] $Event)
+    $url = if ($script:State -and $script:State.Settings) { [string]$script:State.Settings.WebhookUrl } else { '' }
+    if (-not $url) { return }
+    $tpl = if ($script:State.Settings.WebhookTemplate) { [string]$script:State.Settings.WebhookTemplate } else { 'generic' }
+    try {
+        $shaped = Format-WebhookPayload -Template $tpl -Event $Event
+        Start-Job -Name 'NetJump-Webhook' -ScriptBlock {
+            param($u, $b, $ct, $hdrs)
+            try {
+                if ($hdrs -and $hdrs.Count -gt 0) {
+                    Invoke-RestMethod -Uri $u -Method POST -Body $b -ContentType $ct -Headers $hdrs -TimeoutSec 5 | Out-Null
+                } else {
+                    Invoke-RestMethod -Uri $u -Method POST -Body $b -ContentType $ct -TimeoutSec 5 | Out-Null
+                }
+            } catch {}
+        } -ArgumentList $url, $shaped.Body, $shaped.ContentType, $shaped.ExtraHeaders | Out-Null
+    } catch {
+        try { Add-Event warn ("Webhook send failed: $($_.Exception.Message)") } catch {}
+    }
+}
+
 function Send-FlapWebhook {
     param($FlapNumber, $Adapter, $Speed, $LanResult)
-    $url = if ($script:State.Settings) { [string]$script:State.Settings.WebhookUrl } else { '' }
-    if (-not $url) { return }
-    $payload = @{
-        type        = 'flap'
-        host        = $env:COMPUTERNAME
-        adapter     = $Adapter
-        speed       = [string]$Speed
-        flapNumber  = $FlapNumber
-        sessionFlapTotal = $script:State.FlapCount
-        timestamp   = (Get-Date).ToString('o')
-        lanReachable = if ($LanResult) { $LanResult.Reachable } else { $null }
-        lanTotal     = if ($LanResult) { $LanResult.Total }     else { $null }
+    if (-not $script:State.Settings.WebhookUrl) { return }
+    $fields = [ordered]@{
+        Adapter          = [string]$Adapter
+        Speed            = [string]$Speed
+        FlapNumber       = $FlapNumber
+        SessionFlapTotal = $script:State.FlapCount
     }
-    $body = $payload | ConvertTo-Json -Compress
-    Start-Job -Name "NetJump-Webhook-$FlapNumber" -ScriptBlock {
-        param($u, $b)
-        try {
-            Invoke-RestMethod -Uri $u -Method POST -Body $b -ContentType 'application/json' -TimeoutSec 5 | Out-Null
-        } catch {}
-    } -ArgumentList $url, $body | Out-Null
+    if ($LanResult) {
+        $fields['LAN reachable'] = ("{0}/{1}" -f $LanResult.Reachable, $LanResult.Total)
+    }
+    Send-WebhookEvent -Event @{
+        Type     = 'flap'
+        Title    = ("Link flap on $env:COMPUTERNAME (flap #{0})" -f $FlapNumber)
+        Body     = "NetJump detected a link state transition. Capture saved to flap dossier."
+        Severity = if ($FlapNumber -ge 3) { 'critical' } else { 'warn' }
+        Fields   = $fields
+    }
 }
 
 # ---------- Tier 8: send-bundle zip ----------
@@ -15961,6 +16452,26 @@ function Tick {
         foreach ($p in $stillPending) { $script:State.PendingDossiers.Add($p) }
     }
 
+    # ---- GeoIP database (DB-IP Lite) job poll ----
+    if ($script:State.GeoIpJob -and $script:State.GeoIpJob.State -in 'Completed','Failed','Stopped') {
+        try {
+            $r = Receive-Job $script:State.GeoIpJob -Keep -ErrorAction SilentlyContinue
+            if ($r -is [array]) { $r = $r | Where-Object { $_ -is [hashtable] -and $_.ContainsKey('Ok') } | Select-Object -First 1 }
+            if ($r -and $r.Ok) {
+                Add-Event recovery ("GeoIP database fetched: {0} KB. Parsing..." -f $r.SizeKB)
+                if (Load-GeoIpDatabase) {
+                    Add-Event recovery ("GeoIP loaded: {0} IPv4 ranges (DB-IP Lite)" -f @($script:GeoIpRangesV4).Count)
+                } else {
+                    Add-Event warn 'GeoIP database parse failed; lookups will return null.'
+                }
+            } elseif ($r) {
+                Add-Event warn ("GeoIP fetch failed: {0}" -f $r.Error)
+            }
+        } catch { try { Add-Event warn ("GeoIP job error: {0}" -f $_.Exception.Message) } catch {} }
+        Remove-Job $script:State.GeoIpJob -Force -ErrorAction SilentlyContinue
+        $script:State.GeoIpJob = $null
+    }
+
     # ---- Vulnerable-driver list (loldrivers.io) job poll ----
     if ($script:State.VulnDriverJob -and $script:State.VulnDriverJob.State -in 'Completed','Failed','Stopped') {
         try {
@@ -16010,6 +16521,17 @@ function Tick {
             $script:State.NextVulnDriverRefreshAt = $now.AddHours($hours).AddMinutes($jitterMin)
             Add-Event scan ("Vulnerable-driver list auto-refresh firing (next in {0}h)" -f $hours)
             Update-VulnerableDriverList
+        }
+        # GeoIP DB monthly refresh (30 days default; the data only meaningfully changes monthly).
+        if ($script:State.NextGeoIpRefreshAt -and `
+            $now -ge $script:State.NextGeoIpRefreshAt -and `
+            -not $script:State.GeoIpJob) {
+            $hours = if ($script:State.Settings.GeoIpAutoRefreshHours) { [int]$script:State.Settings.GeoIpAutoRefreshHours } else { 720 }
+            if ($hours -lt 24) { $hours = 720 }
+            $jitterMin = [int](Get-Random -Minimum (-60 * $hours / 24) -Maximum (60 * $hours / 24))
+            $script:State.NextGeoIpRefreshAt = $now.AddHours($hours).AddMinutes($jitterMin)
+            Add-Event scan ("GeoIP DB auto-refresh firing (next in {0}h)" -f $hours)
+            Update-GeoIpDatabase
         }
         # ---- Scheduled re-scan ----
         # Settings.ScheduledScanEnabled toggles the feature; ScheduledScanIntervalMin (default 60)
@@ -16319,10 +16841,39 @@ if ($script:HasPktmon -and $script:IsAdmin -and -not $script:CliMode) {
 }
 
 if (-not $script:CliMode) {
-    # Don't auto-run the heavy diagnostic scan on launch - it makes startup feel slow.
-    # User clicks the green "RUN NET DIAGNOSTIC" button when they're ready.
-    $controls.ScanStatus.Text = 'Idle - click RUN NET DIAGNOSTIC (top right) to scan'
-    $controls.ScanStatus.Foreground = (B '#3fb950')
+    # Auto-trigger first scan on launch unless the user opted out via Settings.AutoScanOnLaunch=false.
+    # Default delay is 8 seconds so the UI gets a chance to settle (Tick lights up the sparklines,
+    # ping chart starts populating) before the heavy scan kicks off. Idempotent: the scan button's
+    # _FirstScanDone flag prevents a second auto-fire if the user clicks Re-scan in the meantime.
+    $autoScan = $true
+    if ($script:State.Settings -and ($script:State.Settings.PSObject.Properties.Name -contains 'AutoScanOnLaunch')) {
+        $autoScan = [bool]$script:State.Settings.AutoScanOnLaunch
+    }
+    if ($autoScan) {
+        $delay = if ($script:State.Settings.AutoScanDelaySec) { [int]$script:State.Settings.AutoScanDelaySec } else { 8 }
+        if ($delay -lt 2)  { $delay = 2 }
+        if ($delay -gt 60) { $delay = 60 }
+        $controls.ScanStatus.Text = ("Auto-scan in {0}s... (Settings -> AutoScanOnLaunch to disable)" -f $delay)
+        $controls.ScanStatus.Foreground = (B '#58a6ff')
+        # One-shot DispatcherTimer fires Update-Findings after the delay.
+        $script:_AutoScanTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $script:_AutoScanTimer.Interval = [TimeSpan]::FromSeconds($delay)
+        $script:_AutoScanTimer.Add_Tick({
+            try { $script:_AutoScanTimer.Stop() } catch {}
+            # Bail if the user already kicked off a scan manually.
+            if ($script:_FirstScanDone -or $script:_ScanInProgress) { return }
+            try {
+                Add-Event scan 'Auto-scan firing (first scan after launch).'
+                if ($controls.RescanButton) { $controls.RescanButton.RaiseEvent((New-Object System.Windows.RoutedEventArgs ([System.Windows.Controls.Button]::ClickEvent))) }
+            } catch {
+                try { Add-Event warn ("Auto-scan trigger failed: $($_.Exception.Message)") } catch {}
+            }
+        }.GetNewClosure())
+        $script:_AutoScanTimer.Start()
+    } else {
+        $controls.ScanStatus.Text = 'Idle - click RUN NET DIAGNOSTIC (top right) to scan'
+        $controls.ScanStatus.Foreground = (B '#3fb950')
+    }
 }
 
 # ---------- timer ----------
@@ -17324,6 +17875,14 @@ if ($controls.HideHealthyCheck) {
         Apply-FindingsFilter
     })
 }
+if ($controls.DiffModeCombo) {
+    $controls.DiffModeCombo.Add_SelectionChanged({
+        $sel = $controls.DiffModeCombo.SelectedItem
+        $tag = if ($sel -and $sel.Tag) { [string]$sel.Tag } else { 'all' }
+        $script:DiffMode = $tag
+        Apply-FindingsFilter
+    })
+}
 
 # --- Glossary + primary actions ---
 $controls.GlossaryButton.Add_Click({ Show-Glossary })
@@ -17592,6 +18151,31 @@ if (-not $script:CliMode) {
         $hrs = if ($script:State.Settings.VulnDriverAutoRefreshHours) { [int]$script:State.Settings.VulnDriverAutoRefreshHours } else { 168 }
         if ($hrs -lt 6) { $hrs = 168 }
         $script:State.NextVulnDriverRefreshAt = (Get-Date).AddHours($hrs)
+    }
+}
+
+# GeoIP DB (DB-IP Lite Country) lifecycle. Defaults on - the data is small (~13 MB compressed,
+# ~50 MB uncompressed) and gives real country attribution that the hardcoded $script:CountryCoords
+# 40-entry table can't match. User can disable via Settings.GeoIpEnabled = $false.
+if (-not $script:CliMode) {
+    $geoEnabled = $true
+    if ($script:State.Settings -and ($script:State.Settings.PSObject.Properties.Name -contains 'GeoIpEnabled')) {
+        $geoEnabled = [bool]$script:State.Settings.GeoIpEnabled
+    }
+    if ($geoEnabled) {
+        if (Load-GeoIpDatabase) {
+            Add-Event info ("GeoIP cache loaded: {0:N0} IPv4 ranges" -f @($script:GeoIpRangesV4).Count)
+            try {
+                $age = (Get-Date) - (Get-Item $script:GeoIpDbPath).LastWriteTime
+                if ($age.TotalHours -gt $script:GeoIpTtlHours) { Update-GeoIpDatabase }
+            } catch {}
+        } else {
+            Add-Event info 'GeoIP DB: no cache yet, fetching from db-ip.com (one-time, ~13 MB)...'
+            Update-GeoIpDatabase
+        }
+        $hrs = if ($script:State.Settings.GeoIpAutoRefreshHours) { [int]$script:State.Settings.GeoIpAutoRefreshHours } else { 720 }
+        if ($hrs -lt 24) { $hrs = 720 }
+        $script:State.NextGeoIpRefreshAt = (Get-Date).AddHours($hrs)
     }
 }
 
