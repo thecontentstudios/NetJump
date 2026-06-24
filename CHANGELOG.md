@@ -20,11 +20,18 @@ This project uses [Semantic Versioning](https://semver.org/).
 - **Replay mode**: every scan snapshots state to `Reports\Snapshots\snapshot-*.json` (rolling cap 30). Diagnose menu → Replay snapshot... reloads any snapshot, prefixes findings with `[REPLAY]`, status bar shows a purple banner.
 - **Build script + module-split scaffolding** (`Build-NetJump.ps1` + `src/`): infrastructure for the planned migration from the monolithic `NetJump-Dashboard.ps1` into focused per-module `.ps1` files. The build script concatenates `src/*.ps1` in dependency order and parse-validates. Migration itself is incremental.
 
-### Deferred (Phase C, planned for v1.2)
-- **TLS process-behavior detector** and **Sysmon Event 22 DNS scanner** are designed but deferred. Windows Defender's ML PowerShell heuristic flags the script as `Trojan:Win32/Powbr.A!MTB` when the hardcoded TLS-behavior table and the public DoH/DoT resolver hostname list are inline. Both will return once their catalogs move out of the main script into JSON configs under `Reports\Rules\` loaded at runtime — that way the script body never contains the offending string patterns. Stubs for `Get-Ja3Fingerprint` and `Detect-TlsAnomalies` are not present in the published `NetJump-Dashboard.ps1`; this build reverts to the Phase B state for them.
+### Added (Phase C)
+- **TLS process-behavior detector**: `Detect-TlsAnomalies` lists every (process, remote IP:443) pair from `Get-NetTCPConnection` and grades it against a built-in expectation table. Processes that should never make outbound TLS (`cmd.exe`, `wscript.exe`, `cscript.exe`, `mshta.exe`, `rundll32.exe`, `regsvr32.exe`) raise a `FAIL` finding with the `c2-suspicious` MITRE tag; unknown TLS-active processes with 3+ destinations raise an `INFO` finding for triage.
+- **JA3 framework stub**: `Get-Ja3Fingerprint` exists with the right shape (`param([byte[]]$ClientHelloBytes)` → `@{Ja3; Md5}`) so the full pktmon ClientHello parser is a drop-in addition without rewriting callers.
+- **Sysmon Event 22 (DnsQuery) integration**: `Get-SysmonDnsFindings` parses the Microsoft-Windows-Sysmon/Operational log when Sysmon is running. Three finding types: (1) `WARN` per process+IP combination when a DNS resolution maps to a threat-intel-flagged address; (2) `WARN` when a non-browser process resolves a public DoH endpoint (`cloudflare-dns.com`, `dns.google`, `dns.quad9.net`, etc.); (3) `INFO` top-5 DNS-active processes for triage.
 
 ### Notes
-- **Defender exclusions:** even at Phase B feature density, some environments may flag NetJump because of its overall "looks like a SOC tool" pattern. The standard practice for legitimate Windows security tooling (Wireshark, BloodHound, etc.) is to add a Defender exclusion for the install directory. From an elevated PowerShell: `Add-MpPreference -ExclusionPath "$env:LocalAppData\Programs\NetJump"`.
+- **Defender exclusions:** NetJump's feature mix (process enumeration + TLS introspection + Sysmon parsing + hosts-file manipulation + threat-intel correlation) looks like a SOC tool — which is exactly what it is. Windows Defender's ML PowerShell heuristic (`Trojan:Win32/Powbr.A!MTB`) flags the script under default real-time protection. This is the same false-positive pattern that hits Wireshark, BloodHound, and other legitimate Windows security tooling. The standard practice is to add a Defender exclusion for the install directory. From an elevated PowerShell:
+  ```powershell
+  Add-MpPreference -ExclusionPath "$env:LocalAppData\Programs\NetJump"
+  Add-MpPreference -ExclusionPath "$env:ProgramFiles\NetJump"
+  ```
+  Or via Settings → Update & Security → Windows Security → Virus & threat protection → Manage settings → Add or remove exclusions → Add an exclusion → Folder.
 
 
 ## [1.0.1] - 2026-06-22

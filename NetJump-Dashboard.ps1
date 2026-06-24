@@ -10963,6 +10963,12 @@ function Update-Findings {
             $cnt = @(Get-RecentSysmonEvents -Minutes 5 -Max 200).Count
             $script:Findings.Add((Add-Finding 'OK' 'Sysmon' ("Sysmon ({0}) running - {1} events in last 5 min." -f $sm.Name, $cnt) '' `
                 'Sysmon provides high-fidelity process create / network connection / DNS / image-load / registry events. Microsoft-Windows-Sysmon/Operational log. Tune with a config like SwiftOnSecurity/sysmon-config or Olaf Hartong/sysmon-modular.'))
+            # Per-process DNS attribution via Sysmon Event 22 - threat-intel correlation, DoH evasion,
+            # top-process triage. Skipped silently when Sysmon's loaded config doesn't subscribe to ID 22.
+            try {
+                $dnsFinds = @(Get-SysmonDnsFindings -Minutes 30 -Max 2000)
+                foreach ($df in $dnsFinds) { $script:Findings.Add($df) }
+            } catch { try { Add-Event warn ("Sysmon DNS findings failed: $($_.Exception.Message)") } catch {} }
         } else {
             $script:Findings.Add((Add-Finding 'WARN' 'Sysmon' ("Sysmon installed but {0}." -f $sm.Status) "Start-Service $($sm.Name)"))
         }
@@ -10972,6 +10978,20 @@ function Update-Findings {
             'Sysmon writes detailed events to Microsoft-Windows-Sysmon/Operational. Pair it with a config from SwiftOnSecurity or Olaf Hartong - the HUD will surface its events here once both are present.'))
     }
     } catch { try { Add-Event warn ("Section 'sysmon' failed: $($_.Exception.Message)") } catch {} }
+
+    # TLS process-behavior detector. Lists outbound 443 connections and flags processes that
+    # shouldn't be making them (cmd / wscript / regsvr32 etc). Cheap - no packet inspection.
+    _ScanYield 'Scanning: TLS process behavior...'
+    try {
+        $tlsHits = @(Detect-TlsAnomalies)
+        foreach ($t in $tlsHits) {
+            $msg = "{0} (pid {1}): {2}" -f $t.Process, $t.Pid, $t.Reason
+            $fix = if ($t.Severity -eq 'FAIL') { "Investigate $($t.Process) (pid $($t.Pid)); right-click in PROCESSES tab -> Kill process or Block remote IP." } else { '' }
+            $det = "Process-TLS-behavior detector flags binaries that should never make outbound 443 (cmd/wscript/regsvr32 etc). True JA3 fingerprinting (cipher-suite hashing from ClientHello bytes) is a future enhancement."
+            $script:Findings.Add((Add-Finding $t.Severity 'TLS' $msg $fix $det $t.Mitre))
+        }
+    } catch { try { Add-Event warn ("Section 'TLS anomalies' failed: $($_.Exception.Message)") } catch {} }
+    _RebuildAndFilter
 
     # Tier 12: BYOVD vulnerable driver scan (CIM Win32_SystemDriver query - can be slow)
     _ScanYield 'Scanning: kernel drivers (BYOVD)...'
@@ -13722,6 +13742,178 @@ function Clear-DnsSinkhole {
         $backupLeaf = if ($backup) { Split-Path $backup -Leaf } else { 'n/a' }
         Add-Event recovery ("DNS sinkhole cleared. Backup: {0}" -f $backupLeaf)
     } catch { Add-Event warn ("DNS sinkhole clear failed: $($_.Exception.Message)") }
+}
+
+# ---------- TLS process-behavior + JA3 framework ----------
+# Two-part feature:
+#   * Detect-TlsAnomalies: lists every (process, remote IP:443) pair from Get-NetTCPConnection
+#     and flags processes opening TLS connections to destinations they shouldn't (cmd.exe doing
+#     TLS is almost never legitimate; rundll32 calling out over 443 is a strong C2 indicator).
+#     Built-in expectation table for common Windows binaries.
+#   * JA3 placeholder: Get-Ja3Fingerprint stub returns $null today. Real full ClientHello parsing
+#     from a pktmon capture is a multi-hundred-line undertaking; the stub + data model are in
+#     place so adding the parser later is a drop-in.
+$script:TlsExpectedBehavior = @{
+    # Process leaf -> ExpectedBehavior tag. 'browser' = any 443 destination is OK.
+    # 'system' = svchost/etc. 'anomalous' = should never make outbound TLS at all.
+    'chrome.exe'             = 'browser'
+    'msedge.exe'             = 'browser'
+    'firefox.exe'            = 'browser'
+    'brave.exe'              = 'browser'
+    'opera.exe'              = 'browser'
+    'iexplore.exe'           = 'browser'
+    'svchost.exe'            = 'system'
+    'system'                 = 'system'
+    'searchprotocolhost.exe' = 'system'
+    'searchindexer.exe'      = 'system'
+    'cmd.exe'                = 'anomalous'
+    'wscript.exe'            = 'anomalous'
+    'cscript.exe'            = 'anomalous'
+    'mshta.exe'              = 'anomalous'
+    'rundll32.exe'           = 'anomalous'
+    'regsvr32.exe'           = 'anomalous'
+}
+
+function Get-Ja3Fingerprint {
+    # PLACEHOLDER for real JA3 fingerprinting via pktmon ClientHello parsing.
+    # The data model is: param([byte[]]$ClientHelloBytes) -> returns @{Ja3=string; Md5=string}
+    # where Ja3 follows the canonical format "version,ciphers,extensions,curves,pointformats".
+    # Today this returns $null; the function is here so callers can be written to interrogate it
+    # without rewriting the call sites when the parser lands.
+    param([byte[]]$ClientHelloBytes)
+    return $null
+}
+
+function Detect-TlsAnomalies {
+    # Returns an array of finding-like objects. Cheap - one Get-NetTCPConnection call + a dict
+    # lookup per process. No packet inspection.
+    $hits = New-Object System.Collections.Generic.List[object]
+    try {
+        $conns = Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue |
+                 Where-Object { $_.RemotePort -eq 443 -and $_.RemoteAddress -and
+                     $_.RemoteAddress -notmatch '^(127\.|::1|192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|fe80:)' }
+        $byPid = @{}
+        foreach ($c in $conns) {
+            $k = [int]$c.OwningProcess
+            if (-not $byPid.ContainsKey($k)) { $byPid[$k] = New-Object System.Collections.ArrayList }
+            [void]$byPid[$k].Add(([string]$c.RemoteAddress))
+        }
+        foreach ($pidKey in $byPid.Keys) {
+            $p = Get-Process -Id $pidKey -ErrorAction SilentlyContinue
+            if (-not $p) { continue }
+            $leaf = ($p.ProcessName + '.exe').ToLower()
+            $expected = if ($script:TlsExpectedBehavior.ContainsKey($leaf)) { $script:TlsExpectedBehavior[$leaf] } else { 'unknown' }
+            $remotes  = @($byPid[$pidKey] | Select-Object -Unique)
+            $remoteList = ($remotes | Select-Object -First 3) -join ', '
+            if ($remotes.Count -gt 3) { $remoteList += " (+$($remotes.Count - 3) more)" }
+            if ($expected -eq 'anomalous') {
+                [void]$hits.Add(@{
+                    Severity = 'FAIL'
+                    Process  = $p.ProcessName
+                    Pid      = $pidKey
+                    Reason   = ("Unexpected encrypted connection from binary type '{0}' to {1}" -f $leaf, $remoteList)
+                    Mitre    = 'c2-suspicious'
+                })
+            } elseif ($expected -eq 'unknown' -and $remotes.Count -ge 3) {
+                # Unknown process with multiple TLS destinations - worth a look but not a fail.
+                [void]$hits.Add(@{
+                    Severity = 'INFO'
+                    Process  = $p.ProcessName
+                    Pid      = $pidKey
+                    Reason   = "Unknown TLS-active process with $($remotes.Count) destinations: $remoteList"
+                    Mitre    = ''
+                })
+            }
+        }
+    } catch {}
+    return $hits
+}
+
+# Sysmon Event ID 22 = DnsQuery. Provides per-process DNS attribution that the DNSClient log
+# can't match (DNSClient is system-wide and doesn't reliably tag the requesting process for
+# DoH/DoT bypass attempts). Each event message includes Image, QueryName, QueryStatus, and
+# QueryResults. This function aggregates the last N minutes and produces:
+#   * A WARN finding per process making DNS queries that resolve to a threat-intel-flagged IP.
+#   * A WARN finding if a non-browser process makes DoH-style calls (process+domain).
+#   * An INFO finding listing the top 5 processes by DNS query count for quick triage.
+function Get-SysmonDnsFindings {
+    param([int]$Minutes = 30, [int]$Max = 2000)
+    $findings = New-Object System.Collections.Generic.List[object]
+    $sm = Get-SysmonStatus
+    if (-not $sm -or $sm.Status -ne 'Running') { return $findings }
+    try {
+        $since = (Get-Date).AddMinutes(-$Minutes)
+        $events = @(Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Sysmon/Operational'; Id=22; StartTime=$since} -MaxEvents $Max -ErrorAction SilentlyContinue)
+        if ($events.Count -eq 0) {
+            # Sysmon running but no DNS events - probably means the loaded Sysmon config doesn't
+            # subscribe to DnsQuery. Surface that gently.
+            [void]$findings.Add((Add-Finding 'INFO' 'Sysmon' "Sysmon running but no Event ID 22 (DnsQuery) events in last $Minutes min." `
+                'Update your Sysmon config to enable DnsQuery events; SwiftOnSecurity/sysmon-config and olafhartong/sysmon-modular both enable them by default.' `
+                'Sysmon DNS events provide per-process DNS attribution that the system DNSClient log lacks. Without them, NetJump cannot identify which process resolved a given domain.'))
+            return $findings
+        }
+        # Aggregate by process Image. Track all queries + any that resolved to a threat-intel IP.
+        $byImg = @{}
+        $intelHits = New-Object System.Collections.Generic.List[object]
+        foreach ($e in $events) {
+            $msg = [string]$e.Message
+            $img = ''
+            $qry = ''
+            $res = ''
+            if ($msg -match '(?m)Image:\s*(.+)$')        { $img = $matches[1].Trim() }
+            if ($msg -match '(?m)QueryName:\s*(.+)$')    { $qry = $matches[1].Trim() }
+            if ($msg -match '(?m)QueryResults:\s*(.+)$') { $res = $matches[1].Trim() }
+            if (-not $img -or -not $qry) { continue }
+            $imgLeaf = Split-Path $img -Leaf
+            if (-not $byImg.ContainsKey($imgLeaf)) { $byImg[$imgLeaf] = @{ Count=0; Domains = New-Object System.Collections.Generic.HashSet[string]; Image=$img } }
+            $byImg[$imgLeaf].Count++
+            [void]$byImg[$imgLeaf].Domains.Add($qry.ToLower())
+            # QueryResults is semicolon-separated; each entry is "type:value". Scan for IPs.
+            foreach ($r in ($res -split ';')) {
+                if ($r -match '\b(\d+\.\d+\.\d+\.\d+)\b') {
+                    $ip = $matches[1]
+                    $hit = Test-IpThreat -Ip $ip
+                    if ($hit) {
+                        [void]$intelHits.Add(@{ Process=$imgLeaf; Domain=$qry; Ip=$ip; Source=$hit })
+                    }
+                }
+            }
+        }
+        # Threat-intel-resolving DNS queries: WARN per unique process/IP combination.
+        $seenIntel = @{}
+        foreach ($h in $intelHits) {
+            $key = "$($h.Process)|$($h.Ip)|$($h.Domain)"
+            if ($seenIntel.ContainsKey($key)) { continue }
+            $seenIntel[$key] = $true
+            [void]$findings.Add((Add-Finding 'WARN' 'Sysmon' ("DNS resolution to flagged IP: {0} -> {1} ({2}) by {3}" -f $h.Domain, $h.Ip, $h.Source, $h.Process) `
+                "Investigate $($h.Process); if unexpected, kill and consider New-NetFirewallRule -RemoteAddress $($h.Ip) -Action Block." `
+                "Sysmon Event 22 caught $($h.Process) resolving $($h.Domain) to an IP listed in feed '$($h.Source)'. The browser may not be the requesting process - DNSClient log doesn't tag the requester reliably for DoH; Sysmon does." `
+                'c2-dns'))
+        }
+        # DoH / DoT pattern: non-browser process resolving public encrypted-DNS endpoints.
+        $dohDomains = @('cloudflare-dns.com','dns.google','dns.quad9.net','doh.opendns.com','dns.nextdns.io','dns.adguard.com')
+        $browsers = @('chrome.exe','msedge.exe','firefox.exe','brave.exe','opera.exe','iexplore.exe','safari.exe')
+        foreach ($leaf in $byImg.Keys) {
+            if ($browsers -contains $leaf.ToLower()) { continue }
+            foreach ($d in $byImg[$leaf].Domains) {
+                if ($dohDomains -contains $d) {
+                    [void]$findings.Add((Add-Finding 'WARN' 'Sysmon' ("DoH-style DNS by non-browser: {0} -> {1}" -f $leaf, $d) `
+                        "Inspect $leaf; if it is not a known DNS-over-HTTPS client (Brave/Edge enterprise / dnscrypt-proxy / etc), kill and audit." `
+                        "Sysmon Event 22 shows $leaf resolving $d - a public DoH resolver. Malware often uses DoH to bypass network DNS monitoring." `
+                        'doh-evasion'))
+                    break
+                }
+            }
+        }
+        # Top-5 by query count as INFO for triage.
+        $top = @($byImg.GetEnumerator() | Sort-Object { -$_.Value.Count } | Select-Object -First 5)
+        $topStr = ($top | ForEach-Object { "{0}={1}" -f $_.Key, $_.Value.Count }) -join ', '
+        [void]$findings.Add((Add-Finding 'INFO' 'Sysmon' ("Top DNS-active processes (last {0}m): {1}" -f $Minutes, $topStr) '' `
+            'Per-process DNS query attribution via Sysmon Event 22. Useful for identifying which process triggered a suspicious resolution.'))
+    } catch {
+        try { Add-Event warn ("Sysmon DNS scan failed: $($_.Exception.Message)") } catch {}
+    }
+    return $findings
 }
 
 function Detect-Beacons {
