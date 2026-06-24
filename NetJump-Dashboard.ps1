@@ -365,6 +365,25 @@ $script:AttackMap = @{
     'threat-intel'     = @{ Id='T1071';     Name='C2 over Application Layer Protocol (threat-intel match)' }
 }
 
+# MITRE ATT&CK technique categorization for the coverage panel. Maps each tactic (column in the
+# MITRE matrix) to the list of technique IDs NetJump CAN detect. Used by Show-MitreCoverageDialog.
+$script:AttackTactics = [ordered]@{
+    'Reconnaissance'        = @()
+    'Resource Development'  = @()
+    'Initial Access'        = @('T1078')   # not yet detected but listed for context
+    'Execution'             = @()
+    'Persistence'           = @('T1547.001','T1543.003','T1053.005','T1546.003','T1078')
+    'Privilege Escalation'  = @('T1068','T1543.003','T1547.001')
+    'Defense Evasion'       = @('T1036','T1562.001','T1014','T1071.004','T1090')
+    'Credential Access'     = @('T1003.001','T1557.001','T1557.002')
+    'Discovery'             = @()
+    'Lateral Movement'      = @('T1210','T1021')
+    'Collection'            = @()
+    'Command and Control'   = @('T1071','T1071.004','T1568.002','T1090')
+    'Exfiltration'          = @()
+    'Impact'                = @('T1565.001')
+}
+
 function Get-AttackTag {
     param([string]$Code)
     if (-not $Code -or -not $script:AttackMap.ContainsKey($Code)) { return $null }
@@ -1983,13 +2002,59 @@ function Get-WifiInfo {
 
 # Cached because netsh wlan can take 100-300ms; refresh once per ~3 sec is plenty for the UI.
 $script:WifiCache = @{ At = [DateTime]::MinValue; Info = $null }
+# Ring buffer of BSSID changes for Detect-WifiRoaming. Each entry: @{Time;SSID;BSSID;Signal;Channel}.
+# Trimmed to last 100 by Record-WifiSample so memory stays bounded; finding logic operates on a
+# tail window (default last 5 min).
+$script:WifiBssidHistory = New-Object System.Collections.Generic.List[object]
 function Get-WifiInfoCached {
     param([string]$AdapterName)
     if (((Get-Date) - $script:WifiCache.At).TotalSeconds -lt 3) { return $script:WifiCache.Info }
     $info = Get-WifiInfo -AdapterName $AdapterName
     $script:WifiCache.At = Get-Date
     $script:WifiCache.Info = $info
+    # Record a BSSID-change entry. Only meaningful when the BSSID actually changed; otherwise we
+    # update the trailing entry's signal/timestamp without growing the history.
+    if ($info -and $info.BSSID) {
+        $last = if ($script:WifiBssidHistory.Count -gt 0) { $script:WifiBssidHistory[$script:WifiBssidHistory.Count - 1] } else { $null }
+        if (-not $last -or $last.BSSID -ne $info.BSSID -or $last.SSID -ne $info.SSID) {
+            [void]$script:WifiBssidHistory.Add([pscustomobject]@{
+                Time    = Get-Date
+                SSID    = [string]$info.SSID
+                BSSID   = [string]$info.BSSID
+                Signal  = if ($info.SignalPct) { [int]$info.SignalPct } else { 0 }
+                Channel = [string]$info.Channel
+            })
+            # Cap at 100 entries; trim oldest.
+            while ($script:WifiBssidHistory.Count -gt 100) { $script:WifiBssidHistory.RemoveAt(0) }
+        }
+    }
     return $info
+}
+
+function Detect-WifiRoaming {
+    # Returns finding objects based on the BSSID-change ring buffer. Three states:
+    #   * roaming storm: 3+ distinct BSSIDs in the last 5 minutes -> WARN (mesh thrashing, sometimes
+    #     also rogue-AP / KARMA-style attack indicator).
+    #   * normal mobility: 1-2 distinct BSSIDs in the last 30 min -> INFO (expected on laptops).
+    #   * stable: single BSSID -> nothing to report.
+    $out = New-Object System.Collections.Generic.List[object]
+    if (-not $script:WifiBssidHistory -or $script:WifiBssidHistory.Count -eq 0) { return $out }
+    $now = Get-Date
+    $recent  = @($script:WifiBssidHistory | Where-Object { ($now - $_.Time).TotalMinutes -le 5 })
+    $halfHr  = @($script:WifiBssidHistory | Where-Object { ($now - $_.Time).TotalMinutes -le 30 })
+    $uniq5   = @($recent  | ForEach-Object { $_.BSSID } | Sort-Object -Unique)
+    $uniq30  = @($halfHr  | ForEach-Object { $_.BSSID } | Sort-Object -Unique)
+    if ($uniq5.Count -ge 3) {
+        $list = ($uniq5 | Select-Object -First 4) -join ', '
+        if ($uniq5.Count -gt 4) { $list += " (+$($uniq5.Count - 4) more)" }
+        [void]$out.Add((Add-Finding 'WARN' 'WiFi' ("Roaming storm: {0} distinct BSSIDs in last 5 min ({1})" -f $uniq5.Count, $list) `
+            'Check AP coverage / move closer to a single AP. Persistent storms can indicate mesh thrashing or rogue-AP / KARMA-style attacks.' `
+            'Multiple BSSID changes in a short window mean either weak signal across overlapping APs (mesh/extender placement) or that something nearby is impersonating your SSID with a stronger signal forcing your client to reconnect.'))
+    } elseif ($uniq30.Count -ge 2) {
+        [void]$out.Add((Add-Finding 'INFO' 'WiFi' ("Normal mobility: {0} BSSIDs in last 30 min" -f $uniq30.Count) '' `
+            'Expected on a laptop moving between rooms or mesh nodes.'))
+    }
+    return $out
 }
 
 function Update-LocalNetInfo {
@@ -4367,6 +4432,7 @@ function Show-FixPickerDialog {
     </Border>
     <TextBlock Grid.Row="3" x:Name="StatusLine" Text="" Foreground="{DynamicResource BrushFgFaint}" FontSize="11" Margin="0,8,0,0" TextWrapping="Wrap"/>
     <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+      <Button x:Name="ExportPsBtn" Content="Export selected as .ps1" Padding="10,5" Margin="0,0,8,0" Background="{DynamicResource BrushBorder}" Foreground="{DynamicResource BrushFgPrimary}" BorderBrush="{DynamicResource BrushHoverBg}" ToolTip="Save the selected fixes as a standalone, reviewable PowerShell script. Useful for baseline / golden-image scripts, or for handing off to someone else to run."/>
       <Button x:Name="ApplyBtn"  Content="Apply selected" Padding="14,5" Margin="0,0,8,0" Background="#1f6feb" Foreground="#ffffff" BorderBrush="#2f7fff" FontWeight="Bold" IsDefault="True"/>
       <Button x:Name="CancelBtn" Content="Cancel" Padding="10,5" Background="{DynamicResource BrushBorder}" Foreground="{DynamicResource BrushFgPrimary}" BorderBrush="{DynamicResource BrushHoverBg}"/>
     </StackPanel>
@@ -4658,6 +4724,79 @@ function Show-FixPickerDialog {
         } catch {}
         $w.Close()
     }.GetNewClosure())
+
+    # Export selected fixes as a standalone, auditable .ps1 the user can review and run later. Each
+    # fix becomes a labeled section in the script with the original Description, severity, command,
+    # and a Write-Host echo so the runner sees what's happening. Safe by default: requires the user
+    # to confirm + sign + run it themselves; we never execute the exported script here.
+    $exportBtn = $w.FindName('ExportPsBtn')
+    if ($exportBtn) {
+        $exportBtn.Add_Click({
+            $selected = @($checkboxRefs | Where-Object { $_.IsChecked } | ForEach-Object { $_.Tag })
+            if ($selected.Count -eq 0) {
+                $statusLine.Text = 'Nothing selected. Check at least one item before exporting.'
+                $statusLine.Foreground = (B '#d29922')
+                return
+            }
+            Add-Type -AssemblyName System.Windows.Forms
+            $dlg = New-Object System.Windows.Forms.SaveFileDialog
+            $dlg.InitialDirectory = Join-Path $PSScriptRoot 'Reports'
+            $dlg.FileName         = ("NetJump-fixes-{0}.ps1" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+            $dlg.Filter           = 'PowerShell script (*.ps1)|*.ps1'
+            $dlg.Title            = 'Export selected fixes as PowerShell'
+            if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+            $path = $dlg.FileName
+            try {
+                $sb = New-Object System.Text.StringBuilder
+                [void]$sb.AppendLine('<#')
+                [void]$sb.AppendLine('.SYNOPSIS')
+                [void]$sb.AppendLine('  NetJump-exported fix script. Reviewable, auditable, runnable by hand.')
+                [void]$sb.AppendLine('.DESCRIPTION')
+                [void]$sb.AppendLine(("  Generated by NetJump on {0} for host {1}." -f (Get-Date), $env:COMPUTERNAME))
+                [void]$sb.AppendLine(("  Selected fix count: {0}." -f $selected.Count))
+                [void]$sb.AppendLine('  Each section below is a single fix. Comment out anything you do not want before running.')
+                [void]$sb.AppendLine('  Requires Administrator for fixes that touch services / drivers / firewall.')
+                [void]$sb.AppendLine('#>')
+                [void]$sb.AppendLine('')
+                [void]$sb.AppendLine('[CmdletBinding()]')
+                [void]$sb.AppendLine('param([switch]$WhatIf)')
+                [void]$sb.AppendLine('')
+                [void]$sb.AppendLine('$ErrorActionPreference = "Continue"')
+                [void]$sb.AppendLine('$applied = 0; $failed = 0')
+                [void]$sb.AppendLine('')
+                $idx = 0
+                foreach ($fx in $selected) {
+                    $idx++
+                    [void]$sb.AppendLine(("# --- Fix {0} of {1} -----------------------------" -f $idx, $selected.Count))
+                    [void]$sb.AppendLine(('# Description: ' + ($fx.Description -replace "`r?`n",' ')))
+                    if ($fx.PSObject.Properties['Severity']) { [void]$sb.AppendLine('# Severity:    ' + [string]$fx.Severity) }
+                    if ($fx.PSObject.Properties['Risk'])     { [void]$sb.AppendLine('# Risk tier:   ' + [string]$fx.Risk) }
+                    [void]$sb.AppendLine('try {')
+                    [void]$sb.AppendLine(('  Write-Host "[{0}/{1}] {2}" -ForegroundColor Cyan' -f $idx, $selected.Count, (($fx.Description -replace '"','`"') -replace "`r?`n",' ')))
+                    [void]$sb.AppendLine('  if (-not $WhatIf) {')
+                    [void]$sb.AppendLine('    ' + [string]$fx.Command)
+                    [void]$sb.AppendLine('    $applied++')
+                    [void]$sb.AppendLine('  } else {')
+                    [void]$sb.AppendLine('    Write-Host "  (WhatIf) skipped"')
+                    [void]$sb.AppendLine('  }')
+                    [void]$sb.AppendLine('} catch {')
+                    [void]$sb.AppendLine('  Write-Host "  FAILED: $($_.Exception.Message)" -ForegroundColor Red')
+                    [void]$sb.AppendLine('  $failed++')
+                    [void]$sb.AppendLine('}')
+                    [void]$sb.AppendLine('')
+                }
+                [void]$sb.AppendLine('Write-Host ("`nDone. Applied: {0}  Failed: {1}" -f $applied, $failed)')
+                Set-Content -LiteralPath $path -Value $sb.ToString() -Encoding UTF8
+                $statusLine.Text = ("Exported {0} fix(es) to {1}" -f $selected.Count, (Split-Path $path -Leaf))
+                $statusLine.Foreground = (B '#3fb950')
+                Add-Event fix ("Exported {0} fix(es) as .ps1: {1}" -f $selected.Count, (Split-Path $path -Leaf))
+                try { Start-Process explorer.exe ('/select,"' + $path + '"') } catch {}
+            } catch {
+                $statusLine.Text = "Export failed: $($_.Exception.Message)"
+                $statusLine.Foreground = (B '#f85149')
+            }
+        }.GetNewClosure())
+    }
 
     $w.FindName('CancelBtn').Add_Click({ $w.Close() })
     $w.ShowDialog() | Out-Null
@@ -8323,6 +8462,9 @@ function Save-FlapDossier {
                               <TextBlock Text="{Binding Name}" FontWeight="SemiBold" Foreground="{DynamicResource BrushFgPrimary}"/>
                               <TextBlock Text="{Binding PidLabel}" Foreground="{DynamicResource BrushFgFaint}" FontSize="11" Margin="6,1,0,0"/>
                               <TextBlock Text="{Binding ConnLabel}" Foreground="{DynamicResource BrushFgMuted}" FontSize="11" Margin="10,1,0,0"/>
+                              <Border Background="#1a2030" BorderBrush="{Binding IntegrityHex}" BorderThickness="1" CornerRadius="3" Padding="4,0" Margin="10,0,0,0" VerticalAlignment="Center" ToolTip="Process integrity level (token mandatory label). Higher = more privileged. System/Protected on a network-active process = investigate.">
+                                <TextBlock Text="{Binding IntegrityLabel}" Foreground="{Binding IntegrityHex}" FontSize="10" FontWeight="SemiBold"/>
+                              </Border>
                             </StackPanel>
                             <TextBlock Text="{Binding Path}" Foreground="{DynamicResource BrushFgMuted}" FontSize="11" TextWrapping="Wrap" Margin="0,2,0,0"/>
                             <TextBlock Text="{Binding RemoteSummary}" Foreground="{DynamicResource BrushFgFaint}" FontSize="11" TextWrapping="Wrap" Margin="0,2,0,0"/>
@@ -9299,6 +9441,8 @@ function Save-FlapDossier {
               <Separator/>
               <MenuItem x:Name="MenuProcTree"   Header="Show process tree..."/>
               <MenuItem x:Name="MenuViewEvents"  Header="View events log..."/>
+              <MenuItem x:Name="MenuMitreCoverage" Header="MITRE ATT&amp;CK coverage..."
+                        ToolTip="Show which MITRE ATT&amp;CK techniques NetJump can detect, grouped by tactic. Green pills = covered today."/>
               <MenuItem x:Name="MenuClearEvents" Header="Clear events log  (Ctrl+L)"/>
               <Separator/>
               <MenuItem x:Name="MenuSettings"   Header="Settings..."/>
@@ -9483,7 +9627,7 @@ foreach ($name in 'Dot','DotGlow','AdapterCombo','AdapterDesc','StatusText','Lin
                   'MenuMonitorInstall','MenuMonitorUninstall','MenuOpenRules',
                   'LockdownBadge','LockdownText',
                   'MenuSaveHtml','MenuExportCsv','MenuExportLedger','MenuExportStix','MenuDigest','MenuBundle','MenuOpenReports','MenuReplaySnapshot',
-                  'MenuTheme','MenuMute','MenuProcTree','MenuViewEvents','MenuClearEvents','MenuSettings',
+                  'MenuTheme','MenuMute','MenuProcTree','MenuViewEvents','MenuClearEvents','MenuSettings','MenuMitreCoverage',
                   'RescanButton','OpenReportsButton','FixButton',
                   'KillSwitchPanel','KillSwitchArmHost','KillSwitchRevertHost','KillSwitchArmBtn','KillSwitchRevertBtn','KillSwitchRevertSubtext',
                   'KillSwitchIcon','KillSwitchLabel','KillSwitchSubtext',
@@ -10954,6 +11098,15 @@ function Update-Findings {
     } catch { try { Add-Event warn ("Section 'baseline' failed: $($_.Exception.Message)") } catch {} }
     _RebuildAndFilter
 
+    # Wi-Fi roaming detector. Cheap - reads the BSSID ring buffer maintained by Update-LocalNetInfo
+    # via Get-WifiInfoCached. Only fires findings when the adapter is wireless and the history has
+    # entries; otherwise no-op.
+    _ScanYield 'Scanning: Wi-Fi roaming history...'
+    try {
+        $roamFindings = @(Detect-WifiRoaming)
+        foreach ($rf in $roamFindings) { $script:Findings.Add($rf) }
+    } catch { try { Add-Event warn ("Section 'WiFi roaming' failed: $($_.Exception.Message)") } catch {} }
+
     # Tier 14: Sysmon integration
     _ScanYield 'Scanning: Sysmon status...'
     try {
@@ -11351,6 +11504,65 @@ function Update-Findings {
 
 # ---------- Tier 3: process->network scanner (async) ----------
 $script:ProcScanScript = {
+    # Process integrity-level lookup via Win32 OpenProcessToken + GetTokenInformation.
+    # Compiled once per scan-job; the type lives only inside this runspace's scope.
+    if (-not ('NjIl' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class NjIl {
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+    [DllImport("advapi32.dll", SetLastError = true)] public static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+    [DllImport("advapi32.dll", SetLastError = true)] public static extern bool GetTokenInformation(IntPtr TokenHandle, int TokenInformationClass, IntPtr TokenInformation, uint TokenInformationLength, out uint ReturnLength);
+    [DllImport("advapi32.dll", SetLastError = true)] public static extern IntPtr GetSidSubAuthority(IntPtr pSid, uint nSubAuthority);
+    [DllImport("advapi32.dll", SetLastError = true)] public static extern int GetSidSubAuthorityCount(IntPtr pSid);
+    [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr hObject);
+    public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+    public const uint TOKEN_QUERY = 0x0008;
+    public const int  TokenIntegrityLevel = 25;
+    public static int GetIntegrityRid(int pid) {
+        IntPtr hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, (uint)pid);
+        if (hp == IntPtr.Zero) return -1;
+        try {
+            IntPtr ht = IntPtr.Zero;
+            if (!OpenProcessToken(hp, TOKEN_QUERY, out ht)) return -1;
+            try {
+                uint len = 0;
+                GetTokenInformation(ht, TokenIntegrityLevel, IntPtr.Zero, 0, out len);
+                if (len == 0) return -1;
+                IntPtr buf = Marshal.AllocHGlobal((int)len);
+                try {
+                    if (!GetTokenInformation(ht, TokenIntegrityLevel, buf, len, out len)) return -1;
+                    // TOKEN_MANDATORY_LABEL is SID_AND_ATTRIBUTES { Sid; Attributes; }; Sid is the first IntPtr.
+                    IntPtr sid = Marshal.ReadIntPtr(buf);
+                    int cnt = GetSidSubAuthorityCount(sid);
+                    if (cnt == 0) return -1;
+                    IntPtr lastSub = GetSidSubAuthority(sid, (uint)(cnt - 1));
+                    return Marshal.ReadInt32(lastSub);
+                } finally { Marshal.FreeHGlobal(buf); }
+            } finally { CloseHandle(ht); }
+        } finally { CloseHandle(hp); }
+    }
+}
+'@ -ErrorAction SilentlyContinue
+    }
+    function _Get-IlLabel { param([int]$Pid)
+        $rid = -1
+        try { $rid = [NjIl]::GetIntegrityRid($Pid) } catch {}
+        if ($rid -lt 0) { return @{ Label='?'; Hex='#6e7681' } }
+        # Standard Windows integrity RIDs
+        switch ($rid) {
+            0     { return @{ Label='Untrusted'; Hex='#6e7681' } }
+            4096  { return @{ Label='Low';       Hex='#8b95a8' } }   # 0x1000
+            8192  { return @{ Label='Medium';    Hex='#58a6ff' } }   # 0x2000
+            8448  { return @{ Label='Medium+';   Hex='#58a6ff' } }   # 0x2100
+            12288 { return @{ Label='High';      Hex='#d29922' } }   # 0x3000
+            16384 { return @{ Label='System';    Hex='#f85149' } }   # 0x4000
+            20480 { return @{ Label='Protected'; Hex='#bf6dff' } }   # 0x5000
+            default { return @{ Label=("0x{0:X}" -f $rid); Hex='#6e7681' } }
+        }
+    }
+
     $tcp = Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue
     $udp = Get-NetUDPEndpoint -ErrorAction SilentlyContinue
 
@@ -11469,6 +11681,10 @@ $script:ProcScanScript = {
             }
         } catch {}
 
+        # Process integrity level via Win32 token query. Falls back to '?' for protected processes
+        # (PROTECTED_PROCESS_LIGHT etc) and processes the current session can't OpenProcess.
+        $il = _Get-IlLabel -Pid ([int]$pidKey)
+
         [void]$results.Add([pscustomobject]@{
             Risk            = $risk
             RiskHex         = $riskHex
@@ -11486,6 +11702,8 @@ $script:ProcScanScript = {
             AncestryVisibility = if ($ancestryStr) { 'Visible' } else { 'Collapsed' }
             ChainRisk       = $chainRisk
             ChainRiskColor  = if ($chainRisk) { '#f85149' } else { '#8b95a8' }
+            IntegrityLabel  = $il.Label
+            IntegrityHex    = $il.Hex
         })
     }
 
@@ -15912,6 +16130,95 @@ $script:GlossaryEntries = @(
     @{ Term='Keyboard: Dialogs';      Desc='Esc closes any open modal dialog (fix picker, connection details, path inspection, TLS probe, retransmit investigator, settings, glossary).' }
 )
 
+function Show-MitreCoverageDialog {
+    # Renders NetJump's MITRE ATT&CK coverage as a per-tactic technique list. For each technique
+    # we look it up in $script:AttackMap to see whether NetJump has a detection rule wired in.
+    # Color: green = covered, gray = listed for context but not detected.
+    $coveredIds = @{}
+    foreach ($v in $script:AttackMap.Values) {
+        if ($v -and $v.Id) { $coveredIds[$v.Id] = $true }
+    }
+    $totalIds = ($script:AttackTactics.Values | ForEach-Object { $_ }) | Sort-Object -Unique | Where-Object { $_ }
+    $coveredTotal = @($totalIds | Where-Object { $coveredIds.ContainsKey($_) }).Count
+    $totalCount   = @($totalIds).Count
+    # Build XAML body: one StackPanel per tactic with technique pills.
+    $bodyXaml = New-Object System.Text.StringBuilder
+    foreach ($tactic in $script:AttackTactics.Keys) {
+        $ids = $script:AttackTactics[$tactic]
+        $coveredHere = @($ids | Where-Object { $coveredIds.ContainsKey($_) }).Count
+        $titleColor = if ($coveredHere -gt 0) { '#3fb950' } else { '#6e7681' }
+        [void]$bodyXaml.Append("<StackPanel Margin='0,10,0,0'>")
+        [void]$bodyXaml.Append("<TextBlock Foreground='$titleColor' FontWeight='Bold' FontSize='12'>")
+        [void]$bodyXaml.Append([System.Net.WebUtility]::HtmlEncode($tactic))
+        [void]$bodyXaml.Append("  ($coveredHere/$($ids.Count))")
+        [void]$bodyXaml.Append('</TextBlock>')
+        if ($ids.Count -eq 0) {
+            [void]$bodyXaml.Append("<TextBlock Foreground='#6e7681' FontSize='10' Margin='8,2,0,0'><Italic>(no techniques in NetJump's detection scope yet)</Italic></TextBlock>")
+        } else {
+            [void]$bodyXaml.Append("<WrapPanel Margin='8,4,0,0'>")
+            foreach ($id in $ids) {
+                $hit = $coveredIds.ContainsKey($id)
+                $bg  = if ($hit) { '#143a23' } else { '#1a2030' }
+                $bd  = if ($hit) { '#3fb950' } else { '#3a4255' }
+                $fg  = if ($hit) { '#7ee787' } else { '#8b95a8' }
+                # Find which finding bucket(s) reference this technique - shows up as tooltip.
+                $sources = @($script:AttackMap.GetEnumerator() | Where-Object { $_.Value.Id -eq $id } | ForEach-Object { $_.Key }) -join ', '
+                $tooltip = if ($hit) { "Detected via: $sources" } else { 'Not yet detected by NetJump.' }
+                [void]$bodyXaml.Append("<Border Background='$bg' BorderBrush='$bd' BorderThickness='1' CornerRadius='3' Padding='6,2' Margin='0,0,6,6' ToolTip='")
+                [void]$bodyXaml.Append([System.Net.WebUtility]::HtmlEncode($tooltip))
+                [void]$bodyXaml.Append("'><TextBlock Foreground='$fg' FontFamily='Consolas' FontSize='11'>")
+                [void]$bodyXaml.Append([System.Net.WebUtility]::HtmlEncode($id))
+                [void]$bodyXaml.Append('</TextBlock></Border>')
+            }
+            [void]$bodyXaml.Append('</WrapPanel>')
+        }
+        [void]$bodyXaml.Append('</StackPanel>')
+    }
+    $xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="NetJump MITRE ATT&amp;CK Coverage" Width="780" Height="640" WindowStartupLocation="CenterOwner"
+        Background="{DynamicResource BrushWindowBg}" Foreground="{DynamicResource BrushFgPrimary}" FontFamily="Segoe UI">
+    <Grid Margin="18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <StackPanel Grid.Row="0" Margin="0,0,0,10">
+            <TextBlock Text="MITRE ATT&amp;CK coverage" Foreground="#58a6ff" FontSize="16" FontWeight="Bold"/>
+            <TextBlock Foreground="{DynamicResource BrushFgMuted}" FontSize="11" Margin="0,4,0,0"
+                       Text="NetJump's detection rules grouped by ATT&amp;CK tactic. Green = NetJump can detect this technique today. Gray = listed for context but not yet detected. Hover a pill for the rule name."/>
+            <TextBlock Foreground="{DynamicResource BrushFgFaint}" FontSize="11" Margin="0,4,0,0"
+                       Text="Coverage: $coveredTotal of $totalCount listed techniques. Findings get auto-tagged with their technique ID; you can also filter on the DIAGNOSTICS tab by typing an ID into the search box."/>
+        </StackPanel>
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" Background="{DynamicResource BrushDeepBg}" Padding="12">
+            <StackPanel>$($bodyXaml.ToString())</StackPanel>
+        </ScrollViewer>
+        <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
+            <Button x:Name="OpenMatrixBtn" Content="Open attack.mitre.org" Padding="12,5" Margin="0,0,8,0"/>
+            <Button x:Name="CloseBtn"      Content="Close"                 Padding="14,5" Background="#1f6feb" Foreground="#ffffff"/>
+        </StackPanel>
+    </Grid>
+</Window>
+"@
+    try {
+        [xml]$x = $xaml
+        $rdr = New-Object System.Xml.XmlNodeReader $x
+        $w = [Windows.Markup.XamlReader]::Load($rdr)
+        $w.Owner = $window
+        try { Wire-DialogEscClose $w } catch {}
+        try { Apply-ThemeToChild $w } catch {}
+        $w.FindName('CloseBtn').Add_Click({ $w.Close() })
+        $w.FindName('OpenMatrixBtn').Add_Click({
+            try { Start-Process 'https://attack.mitre.org/matrices/enterprise/' } catch {}
+        })
+        $w.ShowDialog() | Out-Null
+    } catch {
+        [System.Windows.MessageBox]::Show($window, "MITRE coverage dialog failed:`n$_", 'Error', 'OK', 'Error') | Out-Null
+    }
+}
+
 function Show-Glossary {
     [xml]$x = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -18085,6 +18392,7 @@ $controls.MenuMute.Add_Click({
 })
 $controls.MenuProcTree.Add_Click({ Show-ProcessTree })
 $controls.MenuViewEvents.Add_Click({ Show-EventsLogDialog })
+if ($controls.MenuMitreCoverage) { $controls.MenuMitreCoverage.Add_Click({ try { Show-MitreCoverageDialog } catch { Add-Event warn ("MITRE coverage dialog failed: $($_.Exception.Message)") } }) }
 $controls.MenuClearEvents.Add_Click({ $script:Events.Clear() })
 # Tier 34: wire the LIVE EVENTS panel's own Clear button (it was previously orphaned - silently no-op).
 if ($controls.ClearEventsButton) {
