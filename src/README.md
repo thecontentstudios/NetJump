@@ -40,20 +40,59 @@ the [v1.2 roadmap](../CHANGELOG.md). The goal:
 # Parse-validates the output. Headless smoke-tests.
 ```
 
-## Migration approach
+## Migration approach (incremental, low-risk)
 
-Each file is extracted in a separate commit, one at a time:
+Until the full migration is complete, the existing `NetJump-Dashboard.ps1`
+is the source of truth. New features can live in `src/` from day one by
+having the main file **dot-source** them at the end of script load:
 
-1. Copy the target lines to `src/NN-name.ps1`.
-2. Run `Build-NetJump.ps1` to regenerate `NetJump-Dashboard.ps1`.
-3. Diff the regenerated file against the prior one — should be byte-identical
-   except for the section that moved (which now lives in `src/`).
-4. Headless smoke test passes → commit.
+```powershell
+# At the bottom of NetJump-Dashboard.ps1 (before $window.ShowDialog()):
+$srcDir = Join-Path $PSScriptRoot 'src'
+if (Test-Path $srcDir) {
+    Get-ChildItem $srcDir -Filter '*.ps1' | Sort-Object Name | ForEach-Object {
+        try { . $_.FullName } catch { Write-Host "Failed to load $($_.Name): $_" }
+    }
+}
+```
 
-Until all modules are extracted, the build script must be re-runnable
-against partial state (some sections in `src/`, others still inline in
-the main file). Keep `99-core-residual.ps1` as the catch-all for
-unmigrated sections.
+This means:
+
+- **New features**: write them as `src/NN-short-name.ps1` from the start.
+  Copy `src/TEMPLATE-feature.ps1` and fill in. The dot-source picks them
+  up automatically.
+- **Existing features**: extract one at a time. Cut the section out of
+  the main file, paste into `src/NN-name.ps1`, run `Build-NetJump.ps1
+  -SmokeTest`. If parse + headless pass, commit.
+- **Distribution**: still one `.ps1` file. The installer bundles the
+  main file; `src/` is dev-only and ships in the Git tree but the
+  Inno Setup installer doesn't include it (intentional — end users
+  don't need it).
+
+Once enough is extracted that the main file is mostly orchestration,
+flip `Build-NetJump.ps1` to be the canonical builder: it concatenates
+`src/*.ps1` in lexical order into a fresh `NetJump-Dashboard.ps1` for
+release.
+
+## Naming convention
+
+| Prefix | Role |
+|---|---|
+| `00-` | Script header, params, Add-Type assemblies, `Test-Admin` |
+| `01-09` | Script-level state ($script:State, settings, mutex) |
+| `10-19` | Helpers (colors, formatters, small utilities) |
+| `20-29` | Threat-intel / GeoIP / vuln-driver feed plumbing |
+| `30-39` | Scan engine + per-category scan checks |
+| `40-49` | Fix engine, audit log, fix picker |
+| `50-59` | FLOWS, processes, persistence sampling |
+| `60-69` | HTTP server, Prometheus, webhooks |
+| `70-79` | Retransmit investigator, dialog windows |
+| `80-89` | UI XAML, control registration |
+| `90-99` | DispatcherTimer, Tick, schedulers |
+| `99-` | CLI entry, ShowDialog tail |
+
+Don't sweat the exact numbering — leave gaps between files so new ones
+can be inserted without renumbering.
 
 ## Why not just refactor in place?
 

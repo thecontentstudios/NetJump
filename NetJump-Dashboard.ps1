@@ -962,6 +962,101 @@ function Invoke-BlockIpAction {
     }
 }
 
+# Block a specific process binary's outbound traffic via Windows Firewall app-rule. The Description
+# field encodes the expiry timestamp so the Tick janitor can auto-remove expired rules. Always
+# named "NetJump block process <leafname>" so the user can find and remove them in wf.msc.
+function Invoke-BlockProcessAction {
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [string]$Name,
+        [int]$ExpiresInMinutes = 60   # 0 = permanent
+    )
+    if (-not $script:IsAdmin) {
+        [System.Windows.MessageBox]::Show($window, 'Firewall rule creation requires Administrator.', 'Not elevated', 'OK', 'Warning') | Out-Null
+        return
+    }
+    if (-not $Path -or -not (Test-Path $Path)) {
+        [System.Windows.MessageBox]::Show($window, "No valid binary path for this process. Rule needs the actual .exe path.", 'No path', 'OK', 'Warning') | Out-Null
+        return
+    }
+    $leaf = if ($Name) { $Name } else { Split-Path $Path -Leaf }
+    $ruleName = "NetJump block process $leaf"
+    $expiryLabel = if ($ExpiresInMinutes -gt 0) {
+        $expiresAt = (Get-Date).AddMinutes($ExpiresInMinutes).ToString('o')
+        "expires=$expiresAt"
+    } else {
+        'permanent'
+    }
+    $msg = "Create an outbound DENY rule for the binary at:`n`n  $Path`n`nDuration: $(if ($ExpiresInMinutes -gt 0) { "$ExpiresInMinutes minutes (auto-removed by NetJump)" } else { 'permanent' })`n`nRule name: '$ruleName'`nRemoves the rule via: Remove-NetFirewallRule -DisplayName '$ruleName'`n`nProceed?"
+    $r = [System.Windows.MessageBox]::Show($window, $msg, 'Block process at firewall', 'YesNo', 'Question')
+    if ($r -ne 'Yes') { return }
+    try {
+        # Description starts with "NetJump-managed" so the janitor can find these rules cheaply.
+        $desc = "NetJump-managed process block ($expiryLabel) | path=$Path"
+        New-NetFirewallRule -DisplayName $ruleName -Direction Outbound -Action Block -Program $Path -Description $desc -ErrorAction Stop | Out-Null
+        Write-ActionAudit 'block-process' "path=$Path rule=$ruleName" 'success' @{ expiresInMinutes=$ExpiresInMinutes }
+        Add-Event fix ("Blocked process $leaf at firewall (rule: $ruleName; $($expiryLabel))")
+        Add-ActivityMark fix
+        Show-Toast -Title 'NetJump: process blocked' -Message ("$leaf outbound blocked ($($expiryLabel))") -Icon Info
+    } catch {
+        Write-ActionAudit 'block-process' "path=$Path rule=$ruleName" 'failure' "$_"
+        Add-Event warn "Block-Process failed: $_"
+        [System.Windows.MessageBox]::Show($window, "Block failed:`n$_", 'Error', 'OK', 'Error') | Out-Null
+    }
+}
+
+# Block a remote IP for a fixed window. Encodes expiry in the description like Invoke-BlockProcessAction
+# so the janitor can clean up.
+function Invoke-BlockIpTimed {
+    param([Parameter(Mandatory)] [string]$Ip, [int]$ExpiresInMinutes = 60, [string]$Reason = 'NetJump quick block')
+    if (-not $Ip -or $Ip -notmatch '^\d+\.\d+\.\d+\.\d+$') {
+        [System.Windows.MessageBox]::Show($window, "Invalid IPv4: '$Ip'", 'Bad input', 'OK', 'Warning') | Out-Null; return
+    }
+    if (-not $script:IsAdmin) {
+        [System.Windows.MessageBox]::Show($window, 'Firewall rule creation requires Administrator.', 'Not elevated', 'OK', 'Warning') | Out-Null; return
+    }
+    $ruleName = "NetJump quick-block $Ip"
+    $expiryLabel = if ($ExpiresInMinutes -gt 0) {
+        $expiresAt = (Get-Date).AddMinutes($ExpiresInMinutes).ToString('o')
+        "expires=$expiresAt"
+    } else { 'permanent' }
+    try {
+        $desc = "NetJump-managed quick-block ($expiryLabel) | reason=$Reason"
+        New-NetFirewallRule -DisplayName $ruleName -Direction Outbound -Action Block -RemoteAddress $Ip -Description $desc -ErrorAction Stop | Out-Null
+        Write-ActionAudit 'quick-block-ip' "ip=$Ip rule=$ruleName" 'success' @{ expiresInMinutes=$ExpiresInMinutes; reason=$Reason }
+        Add-Event fix ("Quick-blocked $Ip ($($expiryLabel))")
+        Add-ActivityMark fix
+        Show-Toast -Title 'NetJump: IP quick-blocked' -Message ("$Ip outbound blocked ($($expiryLabel))") -Icon Info
+    } catch {
+        Write-ActionAudit 'quick-block-ip' "ip=$Ip rule=$ruleName" 'failure' "$_"
+        Add-Event warn "Quick-block failed: $_"
+    }
+}
+
+# Janitor: scans NetJump-managed firewall rules and removes any past their expiry timestamp.
+# Called from the Tick scheduler block (cheap - one Get-NetFirewallRule call every few minutes).
+$script:_LastFwJanitorAt = [DateTime]::MinValue
+function Invoke-FirewallJanitor {
+    # Throttle to once every 60 seconds; rules typically last hours/days so checking minutely is plenty.
+    if (((Get-Date) - $script:_LastFwJanitorAt).TotalSeconds -lt 60) { return }
+    $script:_LastFwJanitorAt = Get-Date
+    if (-not $script:IsAdmin) { return }
+    try {
+        $rules = @(Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.Description -like 'NetJump-managed*' })
+        foreach ($r in $rules) {
+            if ($r.Description -match 'expires=([\d\-T:\.+]+)') {
+                try {
+                    $expiry = [datetime]$matches[1]
+                    if ((Get-Date) -ge $expiry) {
+                        Remove-NetFirewallRule -DisplayName $r.DisplayName -ErrorAction SilentlyContinue
+                        Add-Event recovery ("Firewall rule expired and removed: $($r.DisplayName)")
+                    }
+                } catch {}
+            }
+        }
+    } catch {}
+}
+
 function Invoke-OpenLocationAction {
     param([string]$Path)
     if (-not $Path) {
@@ -2029,6 +2124,175 @@ function Get-WifiInfoCached {
         }
     }
     return $info
+}
+
+# ---------- Subnet scan / topology discovery ----------
+# Opt-in via Diagnose menu. Fans out 50 parallel ICMP pings across the local /24, then reads
+# Get-NetNeighbor for the populated ARP entries, reverse-DNS each, and saves a JSON snapshot to
+# Reports\Topology\. Each scan produces a list of @{IP;MAC;Hostname;Vendor;LastSeen} entries.
+$script:TopologyDir = Join-Path $PSScriptRoot 'Reports\Topology'
+if (-not (Test-Path $script:TopologyDir)) { New-Item -ItemType Directory -Path $script:TopologyDir -Force | Out-Null }
+
+function Start-SubnetScan {
+    # Fans out the ping sweep + Get-NetNeighbor + reverse-DNS as a single Start-Job.
+    # The job returns @{Ok;Subnet;Found=[psobject];SavedTo}.
+    if ($script:State.TopologyJob) {
+        Add-Event scan 'Subnet scan already in progress.'
+        return
+    }
+    $a = $script:State.Adapter
+    if (-not $a) { Add-Event warn 'Subnet scan: no active adapter.'; return }
+    try {
+        $cfg = Get-NetIPConfiguration -InterfaceIndex $a.ifIndex -ErrorAction SilentlyContinue
+        $ipObj = $cfg | Select-Object -ExpandProperty IPv4Address -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $ipObj) { Add-Event warn 'Subnet scan: no IPv4 on active adapter.'; return }
+        $ip = [string]$ipObj.IPAddress
+        $prefix = [int]$ipObj.PrefixLength
+        if ($prefix -lt 24) {
+            Add-Event warn ("Subnet scan: prefix /{0} is too wide; only /24 and smaller are supported (avoids ICMP storms)." -f $prefix)
+            return
+        }
+    } catch { Add-Event warn ("Subnet scan: adapter info read failed: $($_.Exception.Message)"); return }
+    Add-Event scan ("Subnet scan starting from {0}/{1}..." -f $ip, $prefix)
+    $script:State.TopologyJob = Start-Job -Name 'NetJump-Topology' -ScriptBlock {
+        param($SrcIp, $Prefix, $OutDir)
+        try {
+            # Compute /24 (or smaller) start..end.
+            $oct = $SrcIp -split '\.'
+            $base24 = "{0}.{1}.{2}." -f $oct[0], $oct[1], $oct[2]
+            $startHost = 1
+            $endHost   = 254
+            # Parallel ping sweep using ThreadJob would be faster; we use Test-Connection's -AsJob
+            # equivalent via runspaces. Simple ForEach-Object -Parallel needs PS 7+; PS 5.1 fallback
+            # uses a runspace pool.
+            $hits = New-Object System.Collections.ArrayList
+            $pool = [runspacefactory]::CreateRunspacePool(1, 32)
+            $pool.Open()
+            $tasks = New-Object System.Collections.ArrayList
+            for ($n = $startHost; $n -le $endHost; $n++) {
+                $target = $base24 + $n
+                if ($target -eq $SrcIp) { continue }
+                $ps = [PowerShell]::Create()
+                $ps.RunspacePool = $pool
+                $null = $ps.AddScript({
+                    param($T)
+                    $r = Test-Connection -ComputerName $T -Count 1 -Quiet -TimeoutSeconds 1 -ErrorAction SilentlyContinue
+                    if ($r) { return $T }
+                    return $null
+                }).AddArgument($target)
+                [void]$tasks.Add(@{ PS=$ps; H=$ps.BeginInvoke() })
+            }
+            foreach ($t in $tasks) {
+                $r = $t.PS.EndInvoke($t.H)
+                if ($r) { [void]$hits.Add([string]$r) }
+                try { $t.PS.Dispose() } catch {}
+            }
+            $pool.Close(); $pool.Dispose()
+            # Read ARP table (Get-NetNeighbor) - includes hosts that responded to the ping AND any
+            # that were already cached in the local ARP table from earlier traffic.
+            $neighbors = @(Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {
+                $_.IPAddress -like ($base24 + '*') -and $_.LinkLayerAddress -and $_.LinkLayerAddress -ne '00-00-00-00-00-00'
+            })
+            $found = New-Object System.Collections.ArrayList
+            foreach ($n in $neighbors) {
+                $rev = $null
+                try {
+                    $rev = (Resolve-DnsName -Name $n.IPAddress -Type PTR -DnsOnly -QuickTimeout -ErrorAction SilentlyContinue | Select-Object -First 1).NameHost
+                } catch {}
+                [void]$found.Add([pscustomobject]@{
+                    IP        = [string]$n.IPAddress
+                    MAC       = [string]$n.LinkLayerAddress
+                    Hostname  = if ($rev) { [string]$rev } else { '' }
+                    State     = [string]$n.State
+                    LastSeen  = (Get-Date).ToString('o')
+                })
+            }
+            # Save snapshot.
+            $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+            $path  = Join-Path $OutDir ("topology-$stamp.json")
+            @{
+                timestamp = (Get-Date).ToString('o')
+                host      = $env:COMPUTERNAME
+                subnet    = ($base24 + '0/' + $Prefix)
+                pingHits  = @($hits)
+                neighbors = @($found)
+            } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $path -Encoding UTF8
+            return @{ Ok=$true; Subnet=($base24 + '0/' + $Prefix); Found=@($found); SavedTo=$path }
+        } catch {
+            return @{ Ok=$false; Error="$_" }
+        }
+    } -ArgumentList $ip, $prefix, $script:TopologyDir
+}
+
+# ---------- Sub-second flap detection via NetworkChange events ----------
+# Subscribes to System.Net.NetworkInformation.NetworkChange events for sub-100ms link-state
+# detection. Faster + more reliable than the 2s polling tick. Events fire on a worker thread,
+# so we enqueue them into a thread-safe ConcurrentQueue that Tick consumes on the UI thread.
+# Falls back gracefully if the .NET subscription fails (rare; almost always available).
+$global:NetJumpNetChangeQueue = [System.Collections.Concurrent.ConcurrentQueue[psobject]]::new()
+$script:NetChangeRegistered = $false
+
+function Register-NetworkChangeEvents {
+    if ($script:NetChangeRegistered) { return }
+    try {
+        # Static-class events still work with Register-ObjectEvent in PS 5.1.
+        $null = Register-ObjectEvent -InputObject ([System.Net.NetworkInformation.NetworkChange]) `
+            -EventName 'NetworkAvailabilityChanged' -SourceIdentifier 'NetJump-NetAvail' `
+            -MessageData $global:NetJumpNetChangeQueue -Action {
+                try {
+                    $q = $Event.MessageData
+                    $q.Enqueue([pscustomobject]@{
+                        Type = 'avail'
+                        Time = $Event.TimeGenerated
+                        Detail = if ($Event.SourceEventArgs.IsAvailable) { 'UP' } else { 'DOWN' }
+                    })
+                } catch {}
+            }
+        $null = Register-ObjectEvent -InputObject ([System.Net.NetworkInformation.NetworkChange]) `
+            -EventName 'NetworkAddressChanged' -SourceIdentifier 'NetJump-NetAddr' `
+            -MessageData $global:NetJumpNetChangeQueue -Action {
+                try {
+                    $q = $Event.MessageData
+                    $q.Enqueue([pscustomobject]@{
+                        Type = 'addr'
+                        Time = $Event.TimeGenerated
+                        Detail = 'IP/route change'
+                    })
+                } catch {}
+            }
+        $script:NetChangeRegistered = $true
+        Add-Event info 'NetworkChange events registered (sub-second link-state detection enabled).'
+    } catch {
+        try { Add-Event warn ("NetworkChange registration failed: $($_.Exception.Message). Falling back to 2s polling.") } catch {}
+    }
+}
+
+function Drain-NetworkChangeEvents {
+    # Called from Tick. Pops every queued NetworkChange event and emits an Add-Event line on the
+    # UI thread (where ribbon writes are safe). Each entry's TimeGenerated is millisecond-precision
+    # so a fast UP/DOWN/UP sequence shows up as three lines with their actual sub-second timing.
+    if (-not $global:NetJumpNetChangeQueue) { return }
+    $evt = $null
+    while ($global:NetJumpNetChangeQueue.TryDequeue([ref]$evt)) {
+        try {
+            $stamp = $evt.Time.ToString('HH:mm:ss.fff')
+            $level = if ($evt.Type -eq 'avail' -and $evt.Detail -eq 'DOWN') { 'warn' } else { 'info' }
+            Add-Event $level ("ETW: {0} at {1}  ({2})" -f $evt.Detail, $stamp, $evt.Type)
+            # If a DOWN event arrives, force an immediate ping/status refresh by clearing the
+            # cached fast-NIC status so the next Tick re-reads from .NET (gets the new state in
+            # milliseconds, not the next 2s polling cycle).
+            if ($evt.Type -eq 'avail' -and $evt.Detail -eq 'DOWN') {
+                $script:State.LastFastNicCheckAt = $null
+            }
+        } catch {}
+    }
+}
+
+function Unregister-NetworkChangeEvents {
+    if (-not $script:NetChangeRegistered) { return }
+    try { Unregister-Event -SourceIdentifier 'NetJump-NetAvail' -ErrorAction SilentlyContinue } catch {}
+    try { Unregister-Event -SourceIdentifier 'NetJump-NetAddr'  -ErrorAction SilentlyContinue } catch {}
+    $script:NetChangeRegistered = $false
 }
 
 function Detect-WifiRoaming {
@@ -8443,6 +8707,11 @@ function Save-FlapDossier {
                             <Separator/>
                             <MenuItem Tag="proc-kill"  Header="Kill process"/>
                             <MenuItem Tag="proc-block" Header="Block remote IP at firewall"/>
+                            <MenuItem Header="Block this process's outbound traffic">
+                              <MenuItem Tag="proc-fw-1h"   Header="for 1 hour"/>
+                              <MenuItem Tag="proc-fw-24h"  Header="for 24 hours"/>
+                              <MenuItem Tag="proc-fw-perm" Header="permanently"/>
+                            </MenuItem>
                             <Separator/>
                             <MenuItem Tag="proc-open"  Header="Open binary location"/>
                             <MenuItem Tag="proc-copy"  Header="Copy details to clipboard"/>
@@ -8742,6 +9011,13 @@ function Save-FlapDossier {
                       <Separator/>
                       <MenuItem Tag="flow-filter-proc"  Header="Filter list to this process"/>
                       <MenuItem Tag="flow-filter-clear" Header="Clear filter"/>
+                      <Separator/>
+                      <MenuItem Header="Quick-block this remote IP">
+                        <MenuItem Tag="flow-block-10m"  Header="for 10 minutes"/>
+                        <MenuItem Tag="flow-block-1h"   Header="for 1 hour"/>
+                        <MenuItem Tag="flow-block-24h"  Header="for 24 hours"/>
+                        <MenuItem Tag="flow-block-perm" Header="permanently"/>
+                      </MenuItem>
                       <Separator/>
                       <MenuItem Tag="flow-copy"         Header="Copy event line"/>
                     </ContextMenu>
@@ -9380,6 +9656,8 @@ function Save-FlapDossier {
               <Separator/>
               <MenuItem x:Name="MenuConnMap"   Header="Show connection map..."
                         ToolTip="Visualizes all current outbound TCP connections grouped by remote IP, with country/ASN labels. Quick way to see who you're talking to right now."/>
+              <MenuItem x:Name="MenuSubnetScan" Header="Subnet scan (discover LAN neighbors)..."
+                        ToolTip="Fan-out ICMP ping across the local /24, then read the ARP table for MAC addresses and reverse-DNS each. Saves a JSON snapshot to Reports\Topology\ and emits a finding listing the discovered hosts. Only runs on /24 or smaller subnets - rejects /16 to avoid ICMP storms."/>
               <MenuItem x:Name="MenuFlapTimeline" Header="Flap-capture timeline viewer..."
                         ToolTip="If pktmon is installed and admin rights granted, NetJump auto-captures network packets around each flap event. This viewer parses the saved capture.txt and shows ARP / DHCP / DNS / ICMP / TCP-RST counts on a scrubbable timeline so you can pinpoint what triggered the flap."/>
               <MenuItem x:Name="MenuRescan2"  Header="Re-scan diagnostics  (Ctrl+R)"/>
@@ -9627,7 +9905,7 @@ foreach ($name in 'Dot','DotGlow','AdapterCombo','AdapterDesc','StatusText','Lin
                   'MenuMonitorInstall','MenuMonitorUninstall','MenuOpenRules',
                   'LockdownBadge','LockdownText',
                   'MenuSaveHtml','MenuExportCsv','MenuExportLedger','MenuExportStix','MenuDigest','MenuBundle','MenuOpenReports','MenuReplaySnapshot',
-                  'MenuTheme','MenuMute','MenuProcTree','MenuViewEvents','MenuClearEvents','MenuSettings','MenuMitreCoverage',
+                  'MenuTheme','MenuMute','MenuProcTree','MenuViewEvents','MenuClearEvents','MenuSettings','MenuMitreCoverage','MenuSubnetScan',
                   'RescanButton','OpenReportsButton','FixButton',
                   'KillSwitchPanel','KillSwitchArmHost','KillSwitchRevertHost','KillSwitchArmBtn','KillSwitchRevertBtn','KillSwitchRevertSubtext',
                   'KillSwitchIcon','KillSwitchLabel','KillSwitchSubtext',
@@ -9942,6 +10220,8 @@ $script:State = [pscustomobject]@{
     LastAutoTriggerAt       = $null
     # DNS sinkhole job (StevenBlack-style blocklist).
     SinkholeJob             = $null
+    # Subnet topology scan job (ARP + ping sweep + reverse DNS).
+    TopologyJob             = $null
     # Auto-refresh scheduling (set by init, decremented by Tick). DateTime values.
     NextThreatIntelRefreshAt = $null
     NextVulnDriverRefreshAt  = $null
@@ -11122,6 +11402,11 @@ function Update-Findings {
                 $dnsFinds = @(Get-SysmonDnsFindings -Minutes 30 -Max 2000)
                 foreach ($df in $dnsFinds) { $script:Findings.Add($df) }
             } catch { try { Add-Event warn ("Sysmon DNS findings failed: $($_.Exception.Message)") } catch {} }
+            # DLL hijack detection via Sysmon Event 7 - user-writable-path DLLs with System32 doubles.
+            try {
+                $dllFinds = @(Get-SysmonDllHijackFindings -Minutes 30 -Max 3000)
+                foreach ($df in $dllFinds) { $script:Findings.Add($df) }
+            } catch { try { Add-Event warn ("Sysmon DLL hijack findings failed: $($_.Exception.Message)") } catch {} }
         } else {
             $script:Findings.Add((Add-Finding 'WARN' 'Sysmon' ("Sysmon installed but {0}." -f $sm.Status) "Start-Service $($sm.Name)"))
         }
@@ -11722,6 +12007,65 @@ function Start-ProcessScanAsync {
 }
 
 # ---------- Tier 3: persistence inventory (async) ----------
+# ---------- Persistence diff baseline ----------
+# Each successful persistence scan writes today's snapshot to Reports\Baselines\persistence-YYYY-MM-DD.json
+# (one per UTC day; later scans overwrite). The diff function loads the most-recent OLDER baseline
+# (yesterday or earlier) and returns any current entries whose key isn't in it. Used to flag NEW
+# persistence entries as high-priority WARN events - classic malware first-stage indicator.
+$script:PersistBaselineDir = Join-Path $PSScriptRoot 'Reports\Baselines'
+if (-not (Test-Path $script:PersistBaselineDir)) { New-Item -ItemType Directory -Path $script:PersistBaselineDir -Force | Out-Null }
+
+function _PersistKey { param($Item) "{0}|{1}|{2}" -f [string]$Item.Source, [string]$Item.Name, [string]$Item.Command }
+
+function Save-PersistenceBaseline {
+    if (-not $script:PersistItems -or $script:PersistItems.Count -eq 0) { return }
+    try {
+        $today = (Get-Date).ToString('yyyy-MM-dd')
+        $path  = Join-Path $script:PersistBaselineDir ("persistence-$today.json")
+        $arr = @($script:PersistItems | ForEach-Object { [pscustomobject]@{ Source=[string]$_.Source; Name=[string]$_.Name; Command=[string]$_.Command; Risk=[string]$_.Risk; SignerLabel=[string]$_.SignerLabel } })
+        @{
+            timestamp = (Get-Date).ToString('o')
+            host      = $env:COMPUTERNAME
+            entries   = $arr
+        } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $path -Encoding UTF8
+        # Keep the last 60 days of baselines.
+        $old = @(Get-ChildItem $script:PersistBaselineDir -Filter 'persistence-*.json' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -Skip 60)
+        foreach ($f in $old) { try { Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue } catch {} }
+    } catch { try { Add-Event warn ("Persistence baseline save failed: $($_.Exception.Message)") } catch {} }
+}
+
+function Diff-PersistenceBaseline {
+    # Returns array of current persistence items whose key is not present in the most-recent baseline
+    # OLDER than today (yesterday-or-earlier). First-ever scan returns empty - no baseline to compare.
+    $out = @()
+    if (-not $script:PersistItems -or $script:PersistItems.Count -eq 0) { return $out }
+    try {
+        $today = (Get-Date).ToString('yyyy-MM-dd')
+        $baselines = @(Get-ChildItem $script:PersistBaselineDir -Filter 'persistence-*.json' -ErrorAction SilentlyContinue | Where-Object { $_.BaseName -ne "persistence-$today" } | Sort-Object LastWriteTime -Descending)
+        if ($baselines.Count -eq 0) { return $out }
+        $latest = $baselines[0]
+        $prev = $null
+        try { $prev = Get-Content -LiteralPath $latest.FullName -Raw | ConvertFrom-Json } catch { return $out }
+        $prevKeys = @{}
+        foreach ($e in @($prev.entries)) {
+            $k = _PersistKey $e
+            if ($k) { $prevKeys[$k] = $true }
+        }
+        foreach ($cur in $script:PersistItems) {
+            $k = _PersistKey $cur
+            if ($k -and -not $prevKeys.ContainsKey($k)) {
+                $out += [pscustomobject]@{
+                    Source  = [string]$cur.Source
+                    Name    = [string]$cur.Name
+                    Command = [string]$cur.Command
+                    Risk    = [string]$cur.Risk
+                }
+            }
+        }
+    } catch { try { Add-Event warn ("Persistence diff failed: $($_.Exception.Message)") } catch {} }
+    return $out
+}
+
 $script:PersistScanScript = {
     $items = New-Object System.Collections.ArrayList
     $sigCache = @{}
@@ -14130,6 +14474,59 @@ function Get-SysmonDnsFindings {
             'Per-process DNS query attribution via Sysmon Event 22. Useful for identifying which process triggered a suspicious resolution.'))
     } catch {
         try { Add-Event warn ("Sysmon DNS scan failed: $($_.Exception.Message)") } catch {}
+    }
+    return $findings
+}
+
+# Sysmon Event ID 7 = ImageLoad. When Sysmon is configured to capture image loads (default in
+# SwiftOnSecurity/sysmon-config and olafhartong/sysmon-modular), this function scans the last N
+# minutes and flags potential DLL search-order hijacking:
+#   * DLL loaded from a user-writable path (AppData / Temp / ProgramData / current dir).
+#   * A DLL with the same name exists in %SystemRoot%\System32 (the legitimate location).
+#   That combination is the classic DLL-hijack signature.
+function Get-SysmonDllHijackFindings {
+    param([int]$Minutes = 30, [int]$Max = 3000)
+    $findings = New-Object System.Collections.Generic.List[object]
+    $sm = Get-SysmonStatus
+    if (-not $sm -or $sm.Status -ne 'Running') { return $findings }
+    try {
+        $since = (Get-Date).AddMinutes(-$Minutes)
+        $events = @(Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Sysmon/Operational'; Id=7; StartTime=$since} -MaxEvents $Max -ErrorAction SilentlyContinue)
+        if ($events.Count -eq 0) { return $findings }   # Sysmon not subscribed to ID 7, silent.
+        $sysDir = Join-Path $env:SystemRoot 'System32'
+        $sysWowDir = Join-Path $env:SystemRoot 'SysWOW64'
+        $userPathRx = '\\AppData\\|\\Users\\Public\\|\\ProgramData\\|\\Windows\\Temp\\|\\AppData\\Local\\Temp\\'
+        # Pre-cache System32 DLL listing once per scan (~3000 files).
+        $sysDllSet = @{}
+        try { Get-ChildItem -Path $sysDir -Filter '*.dll' -ErrorAction SilentlyContinue | ForEach-Object { $sysDllSet[$_.Name.ToLower()] = $true } } catch {}
+        try { Get-ChildItem -Path $sysWowDir -Filter '*.dll' -ErrorAction SilentlyContinue | ForEach-Object { $sysDllSet[$_.Name.ToLower()] = $true } } catch {}
+        $seen = @{}
+        foreach ($e in $events) {
+            $msg = [string]$e.Message
+            $img = ''
+            $dll = ''
+            $sig = ''
+            if ($msg -match '(?m)^Image:\s*(.+)$')         { $img = $matches[1].Trim() }
+            if ($msg -match '(?m)ImageLoaded:\s*(.+)$')    { $dll = $matches[1].Trim() }
+            if ($msg -match '(?m)Signature:\s*(.+)$')      { $sig = $matches[1].Trim() }
+            if (-not $dll) { continue }
+            if ($dll -notmatch '\.dll$') { continue }
+            if ($dll -notmatch $userPathRx) { continue }   # only flag DLLs from user-writable paths
+            $leaf = (Split-Path $dll -Leaf).ToLower()
+            if (-not $sysDllSet.ContainsKey($leaf)) { continue }   # no legit System32 counterpart = not hijack-shaped
+            # Dedupe by (loader image | DLL leaf).
+            $key = "$img|$leaf"
+            if ($seen.ContainsKey($key)) { continue }
+            $seen[$key] = $true
+            $loaderLeaf = if ($img) { Split-Path $img -Leaf } else { '(unknown)' }
+            $sigNote = if ($sig -and $sig -ne 'Invalid' -and $sig -ne 'Unavailable') { "  (signed: $sig)" } else { "  (signature: $(if ($sig) { $sig } else { 'unknown' }))" }
+            [void]$findings.Add((Add-Finding 'WARN' 'Sysmon' ("Possible DLL hijack: {0} loaded {1} from {2}{3}" -f $loaderLeaf, $leaf, $dll, $sigNote) `
+                "Investigate $loaderLeaf; if unexpected, kill the process and remove the rogue DLL at $dll." `
+                "DLL search-order hijacking: a DLL with the same name as a legitimate System32 module ($leaf) is being loaded from a user-writable path. Common malware persistence + privilege-escalation technique." `
+                'dll-hijack'))
+        }
+    } catch {
+        try { Add-Event warn ("Sysmon DLL hijack scan failed: $($_.Exception.Message)") } catch {}
     }
     return $findings
 }
@@ -17312,6 +17709,16 @@ function Tick {
             if ($high -gt 0) { Add-Event warn ("Persistence scan flagged {0} HIGH-risk autorun(s)" -f $high) -Source 'persistence' -Severity 'HIGH' }
             else { Add-Event scan "Persistence scan complete: $($script:PersistItems.Count) entries" -Source 'persistence' -Severity 'OK' }
             Update-TabBadges
+            # ---- Persistence diff vs daily baseline ----
+            # Save a daily baseline (one per UTC day, keyed by date). Diff current state against
+            # the most recent baseline; NEW entries get a WARN event (typical malware first stage).
+            try {
+                Save-PersistenceBaseline
+                $newPersist = @(Diff-PersistenceBaseline)
+                foreach ($np in $newPersist) {
+                    Add-Event warn ("NEW persistence entry: {0}\{1}  =>  {2}" -f $np.Source, $np.Name, $np.Command) -Source 'persistence' -Severity 'HIGH'
+                }
+            } catch { try { Add-Event warn ("Persistence baseline diff failed: $($_.Exception.Message)") } catch {} }
         } catch { Add-Event warn "Persistence scan error: $_" -Source 'persistence' }
         Remove-Job $script:State.PersistJob -Force -ErrorAction SilentlyContinue
         $script:State.PersistJob = $null
@@ -17372,6 +17779,24 @@ function Tick {
         }
         $script:State.PendingDossiers.Clear()
         foreach ($p in $stillPending) { $script:State.PendingDossiers.Add($p) }
+    }
+
+    # ---- Subnet topology scan job poll ----
+    if ($script:State.TopologyJob -and $script:State.TopologyJob.State -in 'Completed','Failed','Stopped') {
+        try {
+            $r = Receive-Job $script:State.TopologyJob -Keep -ErrorAction SilentlyContinue
+            if ($r -is [array]) { $r = $r | Where-Object { $_ -is [hashtable] -and $_.ContainsKey('Ok') } | Select-Object -First 1 }
+            if ($r -and $r.Ok) {
+                $n = @($r.Found).Count
+                Add-Event recovery ("Subnet scan complete: {0} neighbors on {1}. Snapshot: {2}" -f $n, $r.Subnet, (Split-Path $r.SavedTo -Leaf))
+                $controls.ScanStatus.Text = ("Subnet scan: {0} neighbors found ({1})" -f $n, (Split-Path $r.SavedTo -Leaf))
+                $controls.ScanStatus.Foreground = (B '#3fb950')
+            } elseif ($r) {
+                Add-Event warn ("Subnet scan failed: {0}" -f $r.Error)
+            }
+        } catch { try { Add-Event warn ("Topology job error: $($_.Exception.Message)") } catch {} }
+        Remove-Job $script:State.TopologyJob -Force -ErrorAction SilentlyContinue
+        $script:State.TopologyJob = $null
     }
 
     # ---- DNS sinkhole job poll ----
@@ -17495,6 +17920,14 @@ function Tick {
             $window.Dispatcher.InvokeAsync({ Update-Findings }) | Out-Null
         }
     } catch { try { Add-Event warn ("Auto-refresh scheduler error: {0}" -f $_.Exception.Message) } catch {} }
+
+    # Firewall rule janitor - removes NetJump-managed rules past their expiry. Self-throttled to
+    # once per minute via $script:_LastFwJanitorAt so it's cheap to call every tick.
+    try { Invoke-FirewallJanitor } catch {}
+
+    # Drain the NetworkChange event queue. Fires sub-100ms after a real link transition vs the
+    # 2-second polling baseline, so flap detection happens nearly instantly when this is active.
+    try { Drain-NetworkChangeEvents } catch {}
 
     # ---- Tier 18: poll threat-intel update job ----
     if ($script:State.ThreatIntelJob -and $script:State.ThreatIntelJob.State -in 'Completed','Failed','Stopped') {
@@ -17712,6 +18145,12 @@ if (-not $script:CliMode -and $script:State.Settings) {
     $persistedTheme = [string]$script:State.Settings.Theme
     if ($persistedTheme -eq 'light') { Apply-Theme 'light' }
     $window.ToolTip = 'Shortcuts: Ctrl+R rescan, F5 rescan, Ctrl+S save report, Ctrl+L clear events, Ctrl+E export CSV, Ctrl+M mute toggle, Ctrl+T theme toggle, F1 glossary'
+}
+
+# Subscribe to .NET NetworkChange events for sub-100ms flap detection. Falls back to 2s polling
+# if registration fails (rare).
+if (-not $script:CliMode) {
+    try { Register-NetworkChangeEvents } catch {}
 }
 
 # Tier 8: start HTTP status server (GUI only)
@@ -18302,6 +18741,15 @@ $controls.MenuThreatRefresh.Add_Click({
     Update-ThreatIntel
 })
 $controls.MenuConnMap.Add_Click({ Show-ConnectionMap })
+if ($controls.MenuSubnetScan) {
+    $controls.MenuSubnetScan.Add_Click({
+        try {
+            Start-SubnetScan
+            $controls.ScanStatus.Text = 'Subnet scan in progress (ping sweep + ARP read + reverse DNS)...'
+            $controls.ScanStatus.Foreground = (B '#58a6ff')
+        } catch { Add-Event warn ("Subnet scan failed to start: $($_.Exception.Message)") }
+    })
+}
 $controls.MenuFlapTimeline.Add_Click({ Show-FlapTimeline })
 
 # --- Remediate menu items ---
@@ -18531,6 +18979,9 @@ $window.AddHandler(
                     [System.Windows.MessageBox]::Show($window, 'No external remote IP recorded for this process.', 'Nothing to block', 'OK', 'Information') | Out-Null
                 }
             }
+            'proc-fw-1h'   { Invoke-BlockProcessAction -Path $row.Path -Name $row.Name -ExpiresInMinutes 60 }
+            'proc-fw-24h'  { Invoke-BlockProcessAction -Path $row.Path -Name $row.Name -ExpiresInMinutes 1440 }
+            'proc-fw-perm' { Invoke-BlockProcessAction -Path $row.Path -Name $row.Name -ExpiresInMinutes 0 }
             'proc-open'   { Invoke-OpenLocationAction -Path $row.Path }
             'proc-copy'   { Invoke-CopyToClipboard ("{0} (pid {1})  path={2}  remote={3}  signer={4}" -f $row.Name, $row.Pid, $row.Path, $row.RemoteSummary, $row.SignerLabel) }
             'persist-disable' { Invoke-DisablePersistenceAction -Item $row }
@@ -18764,6 +19215,10 @@ $window.AddHandler(
             'flow-copy' {
                 Invoke-CopyToClipboard ("{0}  [{1}]  {2}  {3}  {4}  state={5}" -f $row.Time, $row.Type, $row.Proto, $row.Process, $row.Endpoint, $row.State)
             }
+            'flow-block-10m'  { $ip = ([string]$row.Endpoint -split ':')[0]; if ($ip) { Invoke-BlockIpTimed -Ip $ip -ExpiresInMinutes 10   -Reason "FLOWS quick-block for $($row.Process)" } }
+            'flow-block-1h'   { $ip = ([string]$row.Endpoint -split ':')[0]; if ($ip) { Invoke-BlockIpTimed -Ip $ip -ExpiresInMinutes 60   -Reason "FLOWS quick-block for $($row.Process)" } }
+            'flow-block-24h'  { $ip = ([string]$row.Endpoint -split ':')[0]; if ($ip) { Invoke-BlockIpTimed -Ip $ip -ExpiresInMinutes 1440 -Reason "FLOWS quick-block for $($row.Process)" } }
+            'flow-block-perm' { $ip = ([string]$row.Endpoint -split ':')[0]; if ($ip) { Invoke-BlockIpTimed -Ip $ip -ExpiresInMinutes 0    -Reason "FLOWS quick-block for $($row.Process)" } }
             # Tier 57: LIVE EVENTS row context-menu actions
             'event-copy' {
                 # Format: "HH:mm:ss  [SRC] [SEVERITY] message text"
@@ -19273,6 +19728,7 @@ $window.Add_Closed({
     }
     Stop-PktmonCapture
     Stop-HttpServer
+    try { Unregister-NetworkChangeEvents } catch {}
     Save-CurrentSession
     Save-Ledger
     if ($script:TrayIcon) {
@@ -19330,6 +19786,20 @@ if ($script:CliMode) {
     $payload['recommendedFixCount'] = [int]@($result.Fixes).Count
     $payload | ConvertTo-Json -Depth 5
     exit 0
+}
+
+# Dot-source any feature modules in src/ before opening the window. Used during the gradual
+# module-split migration: new features go in src/NN-name.ps1 and load automatically. The
+# installed distributable doesn't include src/ - this loader is dev-only and a silent no-op
+# when the directory is absent. See src/README.md for the migration recipe.
+$srcDir = Join-Path $PSScriptRoot 'src'
+if (Test-Path $srcDir) {
+    $srcFiles = @(Get-ChildItem $srcDir -Filter '*.ps1' -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike 'TEMPLATE-*' } | Sort-Object Name)
+    foreach ($f in $srcFiles) {
+        try { . $f.FullName }
+        catch { try { Add-Event warn ("Module load failed: $($f.Name): $($_.Exception.Message)") } catch {} }
+    }
+    if ($srcFiles.Count -gt 0) { try { Add-Event info ("Loaded $($srcFiles.Count) module(s) from src/.") } catch {} }
 }
 
 [void]$window.ShowDialog()

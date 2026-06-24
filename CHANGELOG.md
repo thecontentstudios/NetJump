@@ -6,6 +6,20 @@ This project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (v1.2 roadmap)
+- **Process integrity level** on the PROCESSES tab. P/Invoke `OpenProcessToken` + `GetTokenInformation(TokenIntegrityLevel)`; maps the SID's last RID to a color-coded pill (Untrusted / Low / Medium / Medium+ / High / System / Protected).
+- **MITRE ATT&CK coverage panel** (View → MITRE ATT&CK coverage…). Lists every technique NetJump can detect, grouped by tactic, with green/gray pills indicating coverage status. Hover for the detection rule name.
+- **Wi-Fi roaming history** — ring buffer of BSSID changes; `Detect-WifiRoaming` flags 3+ BSSIDs in 5 min as a roaming storm (mesh thrashing / rogue-AP indicator).
+- **Fix-script export** — Fix Picker dialog now has an "Export selected as .ps1" button. Writes a fully-commented, auditable PowerShell script with `-WhatIf` support.
+- **Subnet topology discovery** (Diagnose → Subnet scan…). Fan-out ICMP across the local /24, read the populated ARP table, reverse-DNS each. Saves snapshot to `Reports\Topology\`. Refuses to run on /16 or wider to avoid ICMP storms.
+- **DLL hijacking detector** — `Get-SysmonDllHijackFindings` parses Sysmon Event 7 (ImageLoad) for DLLs loaded from user-writable paths (AppData / Temp / ProgramData) that have a legitimate `System32` counterpart of the same name. Classic search-order hijack signature.
+- **Persistence diffing** — daily baselines under `Reports\Baselines\persistence-YYYY-MM-DD.json`; NEW persistence entries (entries not in the most-recent older baseline) emit a high-priority WARN event.
+- **Process-level firewall rules** — PROCESSES right-click → "Block this process's outbound traffic" → for 1 hour / 24 hours / permanently. Reversible via wf.msc or `Remove-NetFirewallRule -DisplayName 'NetJump block process *'`.
+- **Quick-block timed IP rules** — FLOWS right-click → "Quick-block this remote IP" → 10 min / 1 hour / 24 hours / permanent. Per-tick janitor automatically removes rules past their expiry timestamp.
+- **Sub-second flap detection** via `System.Net.NetworkInformation.NetworkChange` events. Replaces 2-second polling baseline with sub-100ms link-state events. Thread-safe `ConcurrentQueue` decouples the event callback (worker thread) from the UI thread that consumes them.
+- **Module-split infrastructure**: `NetJump-Dashboard.ps1` now dot-sources `src/*.ps1` at startup, so new features can live in `src/NN-feature.ps1` from day one without rebuilding. `src/TEMPLATE-feature.ps1` is the copy-this starter; `src/README.md` documents the naming convention + migration recipe. Single-file distribution preserved (installer doesn't bundle `src/`).
+- **Light theme** (existed in earlier code) — confirmed and documented; View → Theme menu toggles dark/light, persisted across launches.
+
 ### Added (v1.1 roadmap, Phases A and B)
 - **Wi-Fi metrics** in LOCAL NET INFO sidebar when on a wireless adapter (SSID, BSSID, channel, signal % + estimated dBm, auth/cipher) via `netsh wlan show interfaces`.
 - **Auto-trigger first scan on launch** after a configurable delay (default 8 seconds). Settings: `AutoScanOnLaunch`, `AutoScanDelaySec`.
