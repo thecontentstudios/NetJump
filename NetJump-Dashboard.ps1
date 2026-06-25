@@ -35,6 +35,19 @@ $script:CliMode = [bool]($Headless -or $Json -or $DailyDigest -or $Monitor)
 # WPF is loaded in both modes; CLI just never calls ShowDialog. Cheap and avoids gate spaghetti.
 Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase,System.Xaml,System.Windows.Forms,System.Drawing,Microsoft.VisualBasic
 
+# Dot-source feature modules from src/. They contribute function + variable definitions; ALL
+# execution (calls into the functions, UI wiring, etc.) still lives in this main file. Loading
+# early means src/ functions are visible to every subsequent line, including the init blocks
+# that call Load-GeoIpDatabase, Update-ThreatIntel, etc. The installed distributable doesn't
+# include src/ - this loader is dev-only and is a silent no-op when the directory is absent.
+# See src/README.md for the migration recipe.
+$srcDir = Join-Path $PSScriptRoot 'src'
+if (Test-Path $srcDir) {
+    foreach ($f in @(Get-ChildItem $srcDir -Filter '*.ps1' -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike 'TEMPLATE-*' } | Sort-Object Name)) {
+        try { . $f.FullName } catch { Write-Host "src/ module load failed ($($f.Name)): $_" }
+    }
+}
+
 # ---------- helpers ----------
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -743,104 +756,8 @@ function Test-ThreatFeedReachable {
 }
 
 # ---------- GeoIP (DB-IP Lite Country) ----------
-# Source: https://download.db-ip.com/free/dbip-country-lite-YYYY-MM.csv.gz (no auth, monthly).
-# Replaces the hardcoded $script:CountryCoords 40-entry table for actual country attribution.
-# IPv4 only for now; v6 lookup falls through to $null gracefully.
-$script:GeoIpDbPath        = Join-Path $script:ThreatIntelDir 'geoip-country.csv'
-$script:GeoIpFeedUrlFormat = 'https://download.db-ip.com/free/dbip-country-lite-{0}.csv.gz'
-$script:GeoIpTtlHours      = 720    # 30-day refresh; the data only changes meaningfully each month.
-$script:GeoIpRangesV4      = $null  # array of [pscustomobject]@{Lo;Hi;CC} sorted by Lo
-$script:GeoIpLoaded        = $false
-$script:GeoIpLastRefresh   = $null
-
-function Load-GeoIpDatabase {
-    $script:GeoIpRangesV4 = $null
-    $script:GeoIpLoaded   = $false
-    if (-not (Test-Path $script:GeoIpDbPath)) { return $false }
-    try {
-        $age = (Get-Date) - (Get-Item $script:GeoIpDbPath).LastWriteTime
-        # Allow up to 2x TTL before discarding - 60-day-old country data is still mostly accurate.
-        if ($age.TotalHours -gt ($script:GeoIpTtlHours * 2)) { return $false }
-        $script:GeoIpLastRefresh = (Get-Item $script:GeoIpDbPath).LastWriteTime
-        $v4 = New-Object System.Collections.Generic.List[psobject]
-        $reader = [System.IO.File]::OpenText($script:GeoIpDbPath)
-        try {
-            while ($null -ne ($line = $reader.ReadLine())) {
-                if (-not $line) { continue }
-                # CSV format: start_ip,end_ip,country_code (DB-IP Lite). No header, no quoting.
-                # IPv6 rows have ':' in the addresses - skip them (v6 lookup falls through to null).
-                if ($line.IndexOf(':') -ge 0) { continue }
-                $parts = $line -split ','
-                if ($parts.Count -lt 3) { continue }
-                $s = $parts[0]; $e = $parts[1]; $cc = $parts[2].Trim()
-                if ($s -notmatch '^(\d+)\.(\d+)\.(\d+)\.(\d+)$') { continue }
-                $lo = ([uint32]$matches[1] -shl 24) -bor ([uint32]$matches[2] -shl 16) -bor ([uint32]$matches[3] -shl 8) -bor [uint32]$matches[4]
-                if ($e -notmatch '^(\d+)\.(\d+)\.(\d+)\.(\d+)$') { continue }
-                $hi = ([uint32]$matches[1] -shl 24) -bor ([uint32]$matches[2] -shl 16) -bor ([uint32]$matches[3] -shl 8) -bor [uint32]$matches[4]
-                $v4.Add([pscustomobject]@{ Lo=$lo; Hi=$hi; CC=$cc })
-            }
-        } finally { $reader.Close() }
-        # DB-IP Lite is already sorted by start_ip; sort again defensively (cheap on already-sorted).
-        $script:GeoIpRangesV4 = @($v4 | Sort-Object Lo)
-        $script:GeoIpLoaded = $true
-        return $true
-    } catch {
-        try { Add-Event warn ("GeoIP load failed: $($_.Exception.Message)") } catch {}
-        return $false
-    }
-}
-
-function Update-GeoIpDatabase {
-    # Async fetch via Start-Job. Decompresses inline to the destination CSV.
-    if ($script:State -and $script:State.GeoIpJob) {
-        Add-Event scan 'GeoIP database update already in progress.'
-        return
-    }
-    $now = Get-Date
-    $month1 = $now.ToString('yyyy-MM')
-    $month2 = $now.AddMonths(-1).ToString('yyyy-MM')
-    Add-Event scan ("GeoIP: fetching db-ip.com country-lite ({0})..." -f $month1)
-    $url1 = $script:GeoIpFeedUrlFormat -f $month1
-    $url2 = $script:GeoIpFeedUrlFormat -f $month2
-    $dest = $script:GeoIpDbPath
-    $job = Start-Job -Name 'NetJump-GeoIp' -ScriptBlock {
-        param($Url1, $Url2, $Dest)
-        $tmp = "$Dest.gz"
-        try {
-            try { Invoke-WebRequest -Uri $Url1 -OutFile $tmp -TimeoutSec 180 -UseBasicParsing -ErrorAction Stop }
-            catch { Invoke-WebRequest -Uri $Url2 -OutFile $tmp -TimeoutSec 180 -UseBasicParsing -ErrorAction Stop }
-            $inF  = [System.IO.File]::OpenRead($tmp)
-            $gz   = New-Object System.IO.Compression.GZipStream($inF, [System.IO.Compression.CompressionMode]::Decompress)
-            $outF = [System.IO.File]::Create($Dest)
-            $gz.CopyTo($outF)
-            $outF.Close(); $gz.Close(); $inF.Close()
-            Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-            return @{ Ok=$true; SizeKB = [int]((Get-Item $Dest).Length / 1024) }
-        } catch {
-            try { Remove-Item $tmp -Force -ErrorAction SilentlyContinue } catch {}
-            return @{ Ok=$false; Error="$_" }
-        }
-    } -ArgumentList $url1, $url2, $dest
-    if ($script:State) { $script:State.GeoIpJob = $job }
-}
-
-function Get-IpCountry {
-    param([string]$Ip)
-    if (-not $Ip -or -not $script:GeoIpLoaded -or -not $script:GeoIpRangesV4) { return $null }
-    if ($Ip -notmatch '^(\d+)\.(\d+)\.(\d+)\.(\d+)$') { return $null }
-    $u = ([uint32]$matches[1] -shl 24) -bor ([uint32]$matches[2] -shl 16) -bor ([uint32]$matches[3] -shl 8) -bor [uint32]$matches[4]
-    # Binary search: find the range where Lo <= u <= Hi.
-    $lo = 0
-    $hi = $script:GeoIpRangesV4.Count - 1
-    while ($lo -le $hi) {
-        $mid = [int](($lo + $hi) / 2)
-        $r = $script:GeoIpRangesV4[$mid]
-        if ($u -lt $r.Lo)      { $hi = $mid - 1 }
-        elseif ($u -gt $r.Hi)  { $lo = $mid + 1 }
-        else                   { return $r.CC }
-    }
-    return $null
-}
+# Moved to src/22-geoip.ps1 in v1.3 as the proof-of-pattern for the src/ migration.
+# The dot-source loader at the top of this file loads it before any code below runs.
 
 function Test-IpThreat {
     param([string]$Ip)
@@ -9676,6 +9593,9 @@ function Save-FlapDossier {
               <MenuItem x:Name="MenuLockdownOn"  Header="Enable lockdown mode (panic)..."/>
               <MenuItem x:Name="MenuLockdownOff" Header="Disable lockdown..."/>
               <Separator/>
+              <MenuItem x:Name="MenuUnblockAllRules" Header="Remove all NetJump-managed firewall rules..."
+                        ToolTip="One-click reversal of every quick-block / process-block rule NetJump has created (rules whose Description starts with 'NetJump-managed'). Asks for confirmation first. Useful if you blocked something you shouldn't have and don't want to hunt for the rule in wf.msc."/>
+              <Separator/>
               <MenuItem x:Name="MenuMonitorInstall"   Header="Install background monitor (run at logon)..."/>
               <MenuItem x:Name="MenuMonitorUninstall" Header="Uninstall background monitor"/>
             </ContextMenu>
@@ -9721,6 +9641,8 @@ function Save-FlapDossier {
               <MenuItem x:Name="MenuViewEvents"  Header="View events log..."/>
               <MenuItem x:Name="MenuMitreCoverage" Header="MITRE ATT&amp;CK coverage..."
                         ToolTip="Show which MITRE ATT&amp;CK techniques NetJump can detect, grouped by tactic. Green pills = covered today."/>
+              <MenuItem x:Name="MenuKeyboardShortcuts" Header="Keyboard shortcuts..."
+                        ToolTip="Show every keyboard binding in the HUD (Ctrl+/, Ctrl+R, F5, etc.). Also available via Ctrl+/."/>
               <MenuItem x:Name="MenuClearEvents" Header="Clear events log  (Ctrl+L)"/>
               <Separator/>
               <MenuItem x:Name="MenuSettings"   Header="Settings..."/>
@@ -9905,7 +9827,7 @@ foreach ($name in 'Dot','DotGlow','AdapterCombo','AdapterDesc','StatusText','Lin
                   'MenuMonitorInstall','MenuMonitorUninstall','MenuOpenRules',
                   'LockdownBadge','LockdownText',
                   'MenuSaveHtml','MenuExportCsv','MenuExportLedger','MenuExportStix','MenuDigest','MenuBundle','MenuOpenReports','MenuReplaySnapshot',
-                  'MenuTheme','MenuMute','MenuProcTree','MenuViewEvents','MenuClearEvents','MenuSettings','MenuMitreCoverage','MenuSubnetScan',
+                  'MenuTheme','MenuMute','MenuProcTree','MenuViewEvents','MenuClearEvents','MenuSettings','MenuMitreCoverage','MenuSubnetScan','MenuKeyboardShortcuts','MenuUnblockAllRules',
                   'RescanButton','OpenReportsButton','FixButton',
                   'KillSwitchPanel','KillSwitchArmHost','KillSwitchRevertHost','KillSwitchArmBtn','KillSwitchRevertBtn','KillSwitchRevertSubtext',
                   'KillSwitchIcon','KillSwitchLabel','KillSwitchSubtext',
@@ -10585,6 +10507,34 @@ function Add-Event {
         elseif ($Text -match '(?i)\bkill(ed)? (pid|process)\b|\bcmdline\b|\borphan(ed)?( process)?\b|\bsuspicious (process|exe(cutable)?)\b|\bprocess scan\b|\bkilled process\b') { $Source = 'processes' }
         elseif ($Text -match '(?i)\bpersistence\b|\brun\s?key\b|\bregistry autorun\b|\bscheduled task\b|\bautorun\b|\bstartup item\b|\bservice install\b|\bauto-?start\b') { $Source = 'persistence' }
         # else: stays 'system' (gray) - genuine diagnostic / scan / kill-switch / ARP / fix-bundle events
+    }
+
+    # ---- Notification grouping (v1.3) ----
+    # Coalesce identical warn/info messages within a short window so a repeating issue doesn't
+    # spam the LIVE EVENTS feed. Keyed by Type+Source+leading-80-chars-of-Text. First event in a
+    # window passes through unchanged; subsequent events within the window increment a counter
+    # and are silenced. When the window closes, a "(N similar since HH:mm:ss)" rollup fires
+    # automatically on the next call - no separate timer needed.
+    if ($Type -eq 'warn' -or $Type -eq 'info') {
+        if (-not $script:_EventGroupCache) { $script:_EventGroupCache = @{} }
+        $key = "$Type|$Source|" + ([string]$Text).Substring(0, [Math]::Min(80, ([string]$Text).Length))
+        $now = Get-Date
+        $entry = $script:_EventGroupCache[$key]
+        $windowSec = 30
+        if ($entry -and (($now - $entry.LastAt).TotalSeconds -lt $windowSec)) {
+            # Within window: silence + bump count.
+            $entry.Count++
+            $entry.LastAt = $now
+            return
+        }
+        # Window expired (or first hit): if there's a backlog from the prior window, emit a rollup.
+        if ($entry -and $entry.Count -gt 1) {
+            $rollupText = ("({0} similar '{1}' events suppressed since {2})" -f ($entry.Count - 1), $entry.Sample, $entry.FirstAt.ToString('HH:mm:ss'))
+            # Recurse with Source='system' so the rollup doesn't loop back into grouping.
+            try { Add-Event 'info' $rollupText -Source 'system' } catch {}
+        }
+        # Reset and pass through the new event.
+        $script:_EventGroupCache[$key] = @{ Count=1; FirstAt=$now; LastAt=$now; Sample=([string]$Text).Substring(0, [Math]::Min(60, ([string]$Text).Length)) }
     }
 
     # Tier 35: respect per-feed filter flags. Each event carries a Source tag; events whose source
@@ -18760,6 +18710,37 @@ $controls.MenuLockdownOn.Add_Click({ Enable-Lockdown })
 $controls.MenuLockdownOff.Add_Click({ Disable-Lockdown })
 $controls.MenuMonitorInstall.Add_Click({ Install-BackgroundMonitor })
 $controls.MenuMonitorUninstall.Add_Click({ Uninstall-BackgroundMonitor })
+if ($controls.MenuUnblockAllRules) {
+    $controls.MenuUnblockAllRules.Add_Click({
+        if (-not $script:IsAdmin) {
+            [System.Windows.MessageBox]::Show($window, 'Removing firewall rules requires Administrator.', 'Not elevated', 'OK', 'Warning') | Out-Null
+            return
+        }
+        try {
+            $rules = @(Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.Description -like 'NetJump-managed*' })
+        } catch {
+            [System.Windows.MessageBox]::Show($window, "Couldn't enumerate firewall rules: $($_.Exception.Message)", 'Error', 'OK', 'Error') | Out-Null
+            return
+        }
+        if ($rules.Count -eq 0) {
+            [System.Windows.MessageBox]::Show($window, 'No NetJump-managed firewall rules found.', 'Nothing to remove', 'OK', 'Information') | Out-Null
+            return
+        }
+        $sample = ($rules | Select-Object -First 5 -ExpandProperty DisplayName) -join "`n  - "
+        $suffix = if ($rules.Count -gt 5) { "`n  - ... and $($rules.Count - 5) more" } else { '' }
+        $msg = "Remove ALL NetJump-managed firewall rules?`n`nFound $($rules.Count) rule(s):`n  - $sample$suffix`n`nThis includes every quick-block and process-block NetJump has created. Other firewall rules (set by Windows, by you, or by other apps) are not touched."
+        $r = [System.Windows.MessageBox]::Show($window, $msg, 'Remove all NetJump firewall rules', 'YesNo', 'Question')
+        if ($r -ne 'Yes') { return }
+        $removed = 0; $failed = 0
+        foreach ($rule in $rules) {
+            try { Remove-NetFirewallRule -DisplayName $rule.DisplayName -ErrorAction Stop; $removed++ }
+            catch { $failed++ }
+        }
+        Write-ActionAudit 'unblock-all-rules' "count=$($rules.Count)" 'success' @{ removed=$removed; failed=$failed }
+        Add-Event recovery ("Removed {0} NetJump-managed firewall rule(s){1}." -f $removed, $(if ($failed -gt 0) { ", $failed failed" } else { '' }))
+        [System.Windows.MessageBox]::Show($window, ("Done. Removed: {0}.  Failed: {1}." -f $removed, $failed), 'Done', 'OK', 'Information') | Out-Null
+    })
+}
 
 # --- Export menu items ---
 $controls.MenuSaveHtml.Add_Click({ Save-HtmlReport })
@@ -18841,6 +18822,7 @@ $controls.MenuMute.Add_Click({
 $controls.MenuProcTree.Add_Click({ Show-ProcessTree })
 $controls.MenuViewEvents.Add_Click({ Show-EventsLogDialog })
 if ($controls.MenuMitreCoverage) { $controls.MenuMitreCoverage.Add_Click({ try { Show-MitreCoverageDialog } catch { Add-Event warn ("MITRE coverage dialog failed: $($_.Exception.Message)") } }) }
+if ($controls.MenuKeyboardShortcuts) { $controls.MenuKeyboardShortcuts.Add_Click({ try { Show-KeyboardShortcutsDialog } catch { Add-Event warn ("Keyboard shortcuts dialog failed: $($_.Exception.Message)") } }) }
 $controls.MenuClearEvents.Add_Click({ $script:Events.Clear() })
 # Tier 34: wire the LIVE EVENTS panel's own Clear button (it was previously orphaned - silently no-op).
 if ($controls.ClearEventsButton) {
@@ -19338,6 +19320,9 @@ $window.Add_PreviewKeyDown({
             'D7' { if ($controls.LeftTabs -and $controls.LeftTabs.Items.Count -gt 6) { $controls.LeftTabs.SelectedIndex = 6; $e.Handled = $true } }
             # Tier 56: Ctrl+, opens Settings (matches Windows convention - VS Code, Chrome, etc.)
             'OemComma' { if ($controls.MenuSettings) { $controls.MenuSettings.RaiseEvent((New-Object System.Windows.RoutedEventArgs ([System.Windows.Controls.MenuItem]::ClickEvent))); $e.Handled = $true } }
+            # v1.3: Ctrl+/ opens the keyboard-shortcuts cheatsheet. OemQuestion is the WPF key code
+            # for the slash/question-mark key on a US layout.
+            'OemQuestion' { try { Show-KeyboardShortcutsDialog } catch {}; $e.Handled = $true }
         }
     } elseif ($e.Key -eq 'F5') { Update-Findings; $e.Handled = $true }
     elseif   ($e.Key -eq 'F1') { Show-Glossary;   $e.Handled = $true }
@@ -19786,20 +19771,6 @@ if ($script:CliMode) {
     $payload['recommendedFixCount'] = [int]@($result.Fixes).Count
     $payload | ConvertTo-Json -Depth 5
     exit 0
-}
-
-# Dot-source any feature modules in src/ before opening the window. Used during the gradual
-# module-split migration: new features go in src/NN-name.ps1 and load automatically. The
-# installed distributable doesn't include src/ - this loader is dev-only and a silent no-op
-# when the directory is absent. See src/README.md for the migration recipe.
-$srcDir = Join-Path $PSScriptRoot 'src'
-if (Test-Path $srcDir) {
-    $srcFiles = @(Get-ChildItem $srcDir -Filter '*.ps1' -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike 'TEMPLATE-*' } | Sort-Object Name)
-    foreach ($f in $srcFiles) {
-        try { . $f.FullName }
-        catch { try { Add-Event warn ("Module load failed: $($f.Name): $($_.Exception.Message)") } catch {} }
-    }
-    if ($srcFiles.Count -gt 0) { try { Add-Event info ("Loaded $($srcFiles.Count) module(s) from src/.") } catch {} }
 }
 
 [void]$window.ShowDialog()

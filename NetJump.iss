@@ -65,6 +65,12 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 ; Desktop shortcut is opt-in (matches the Chrome / Discord / VS Code convention).
 ; Start Menu shortcut is NOT a Task - it's unconditional (every installed program should have one).
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
+; Defender exclusion is opt-in. NetJump's process-inspection / TLS-introspection / Sysmon-parsing
+; combo trips Windows Defender's ML PowerShell heuristic (Trojan:Win32/Powbr.A!MTB) on default
+; real-time protection. Same false-positive pattern as Wireshark / BloodHound. Adding the install
+; directory to Defender's ExclusionPath list resolves it. Only relevant for per-machine installs;
+; per-user installs can have the user add the exclusion themselves later if needed.
+Name: "addmpexclusion"; Description: "Add Microsoft Defender exclusion for the install folder (recommended)"; GroupDescription: "Recommended:"; Check: IsAdminInstallMode
 
 [Files]
 ; Core
@@ -85,8 +91,23 @@ Name: "{group}\Uninstall {#MyAppName}";    Filename: "{uninstallexe}";        Co
 Name: "{autodesktop}\{#MyAppName}";        Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Comment: "Network + security diagnostic HUD"; IconFilename: "{app}\{#MyAppIcon}"; Tasks: desktopicon
 
 [Run]
+; Add Defender exclusion for the install dir (silent; runs only if the user ticked addmpexclusion).
+; Requires admin so the gate is the addmpexclusion Task's Check function above. PowerShell command
+; is the standard Add-MpPreference -ExclusionPath - same one users would run by hand.
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; \
+    Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command ""Add-MpPreference -ExclusionPath '{app}' -ErrorAction SilentlyContinue"""; \
+    Flags: runhidden waituntilterminated; \
+    Tasks: addmpexclusion
 ; Offer to launch NetJump immediately after install.
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName} now"; WorkingDir: "{app}"; Flags: postinstall shellexec nowait skipifsilent
+
+[UninstallRun]
+; Remove the Defender exclusion at uninstall time (best-effort, silent). No harm if the exclusion
+; isn't there - Remove-MpPreference is idempotent.
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; \
+    Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command ""Remove-MpPreference -ExclusionPath '{app}' -ErrorAction SilentlyContinue"""; \
+    Flags: runhidden waituntilterminated; \
+    RunOnceId: "RemoveNetJumpDefenderExclusion"
 
 [Code]
 // Block install on systems without Windows PowerShell 5.1+ (every Win10 1607+ has it).
