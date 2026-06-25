@@ -11389,6 +11389,17 @@ function Update-Findings {
     }
     } catch { try { Add-Event warn ("Section 'sysmon' failed: $($_.Exception.Message)") } catch {} }
 
+    # v1.3: Defender exclusion audit + LSA Auth/Notification Packages check. Both implemented in
+    # src/31-security-audits.ps1; cheap and read-only.
+    _ScanYield 'Scanning: Defender exclusions + LSA packages...'
+    try {
+        foreach ($f in @(Get-DefenderExclusionFindings)) { $script:Findings.Add($f) }
+    } catch { try { Add-Event warn ("Section 'Defender exclusions' failed: $($_.Exception.Message)") } catch {} }
+    try {
+        foreach ($f in @(Get-LsaAuthPackageFindings)) { $script:Findings.Add($f) }
+    } catch { try { Add-Event warn ("Section 'LSA packages' failed: $($_.Exception.Message)") } catch {} }
+    _RebuildAndFilter
+
     # TLS process-behavior detector. Lists outbound 443 connections and flags processes that
     # shouldn't be making them (cmd / wscript / regsvr32 etc). Cheap - no packet inspection.
     _ScanYield 'Scanning: TLS process behavior...'
