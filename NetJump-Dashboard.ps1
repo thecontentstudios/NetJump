@@ -9168,6 +9168,23 @@ function Save-FlapDossier {
                 </StackPanel>
               </Border>
 
+              <!-- v1.3: Wi-Fi roaming card. Collapsed when no roaming history collected (= adapter isn't wireless). -->
+              <Border x:Name="WifiRoamingCard" Grid.Row="2" Background="{DynamicResource BrushDeepBg}" BorderBrush="#bf6dff" BorderThickness="1" CornerRadius="6" Padding="14" Margin="0,8,0,0"
+                      Visibility="Collapsed"
+                      ToolTip="Visualizes BSSID changes recorded by Get-WifiInfoCached. Each dot is a roaming event - position = time, color = signal % (green=strong, amber=mid, red=weak). Bursts of dots in a short window indicate roaming storms.">
+                <StackPanel>
+                  <Grid Margin="0,0,0,8">
+                    <Grid.ColumnDefinitions>
+                      <ColumnDefinition Width="*"/>
+                      <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0" Text="Wi-Fi roaming timeline" Foreground="#bf6dff" FontWeight="Bold" FontSize="11"/>
+                    <TextBlock Grid.Column="1" x:Name="WifiRoamingStats" Text="" FontSize="9" Foreground="{DynamicResource BrushFgFaint}" VerticalAlignment="Center"/>
+                  </Grid>
+                  <Canvas x:Name="WifiRoamingCanvas" Height="60" Background="Transparent"/>
+                </StackPanel>
+              </Border>
+
               <!-- session list (row 3 now - row 2 holds the heatmap card; row 1 holds the new summary stats) -->
               <ScrollViewer Grid.Row="3" VerticalScrollBarVisibility="Auto" Background="Transparent" CanContentScroll="True">
                 <ItemsControl x:Name="SessionList" Style="{StaticResource VirtList}">
@@ -9573,6 +9590,8 @@ function Save-FlapDossier {
               <Separator/>
               <MenuItem x:Name="MenuConnMap"   Header="Show connection map..."
                         ToolTip="Visualizes all current outbound TCP connections grouped by remote IP, with country/ASN labels. Quick way to see who you're talking to right now."/>
+              <MenuItem x:Name="MenuSnapshotDiff" Header="Diff two snapshots..."
+                        ToolTip="Pick two snapshot JSONs from Reports\Snapshots\ - the diff viewer shows findings ONLY IN A (resolved since A), ONLY IN B (appeared since A), and IN BOTH. Useful for 'what changed since Monday?' investigations."/>
               <MenuItem x:Name="MenuSubnetScan" Header="Subnet scan (discover LAN neighbors)..."
                         ToolTip="Fan-out ICMP ping across the local /24, then read the ARP table for MAC addresses and reverse-DNS each. Saves a JSON snapshot to Reports\Topology\ and emits a finding listing the discovered hosts. Only runs on /24 or smaller subnets - rejects /16 to avoid ICMP storms."/>
               <MenuItem x:Name="MenuFlapTimeline" Header="Flap-capture timeline viewer..."
@@ -9612,6 +9631,8 @@ function Save-FlapDossier {
                         ToolTip="Exports the rows visible in whichever tab is currently active (Diagnostics, Processes, Persistence, DNS, Traffic, History). For piping into Excel / SIEM / etc."/>
               <MenuItem x:Name="MenuExportLedger" Header="Export connection ledger as CSV"
                         ToolTip="Dumps the long-running beacon/connection ledger - every (process, remote IP, port) combination NetJump has seen, with first/last-seen and sample count. Survives across launches; pruned to 7 days."/>
+              <MenuItem x:Name="MenuLedgerSearch" Header="Search ledger..."
+                        ToolTip="Searchable view of the connection ledger with country / threat-intel enrichment. Type a process name, IP, port, country code, or threat tag to filter."/>
               <MenuItem x:Name="MenuExportStix"   Header="Export STIX 2.1 bundle (SOC handoff)"
                         ToolTip="Builds a STIX 2.1 JSON bundle of suspicious indicators (HIGH-risk processes, beaconing connections, threat-intel hits) suitable for ingest into a SOAR/SIEM platform. STIX is the structured-threat-info standard MITRE / CISA use."/>
               <MenuItem x:Name="MenuDigest"    Header="Build daily digest"
@@ -9826,8 +9847,8 @@ foreach ($name in 'Dot','DotGlow','AdapterCombo','AdapterDesc','StatusText','Lin
                   'MenuDriver','MenuNetReset','MenuIpv6','MenuLockdownOn','MenuLockdownOff',
                   'MenuMonitorInstall','MenuMonitorUninstall','MenuOpenRules',
                   'LockdownBadge','LockdownText',
-                  'MenuSaveHtml','MenuExportCsv','MenuExportLedger','MenuExportStix','MenuDigest','MenuBundle','MenuOpenReports','MenuReplaySnapshot',
-                  'MenuTheme','MenuMute','MenuProcTree','MenuViewEvents','MenuClearEvents','MenuSettings','MenuMitreCoverage','MenuSubnetScan','MenuKeyboardShortcuts','MenuUnblockAllRules',
+                  'MenuSaveHtml','MenuExportCsv','MenuExportLedger','MenuLedgerSearch','MenuExportStix','MenuDigest','MenuBundle','MenuOpenReports','MenuReplaySnapshot',
+                  'MenuTheme','MenuMute','MenuProcTree','MenuViewEvents','MenuClearEvents','MenuSettings','MenuMitreCoverage','MenuSubnetScan','MenuKeyboardShortcuts','MenuUnblockAllRules','MenuSnapshotDiff',
                   'RescanButton','OpenReportsButton','FixButton',
                   'KillSwitchPanel','KillSwitchArmHost','KillSwitchRevertHost','KillSwitchArmBtn','KillSwitchRevertBtn','KillSwitchRevertSubtext',
                   'KillSwitchIcon','KillSwitchLabel','KillSwitchSubtext',
@@ -9835,6 +9856,7 @@ foreach ($name in 'Dot','DotGlow','AdapterCombo','AdapterDesc','StatusText','Lin
                   'LocalAdapterText','LocalIpv4Text','LocalMaskText','LocalGwText','LocalMacText','LocalDnsText','LocalDhcpText','LocalLeaseText','LocalPublicIpText',
                   'LocalMtuText','LocalMssText',
                   'LocalWifiPanel','LocalWifiSsidText','LocalWifiBssidText','LocalWifiChanText','LocalWifiSignalText','LocalWifiAuthText',
+                  'WifiRoamingCard','WifiRoamingStats','WifiRoamingCanvas',
                   'LocalRenewBtn','LocalFlushDnsBtn','LocalArpFlushBtn','LocalResetIpBtn','LocalMtuBtn',
                   'TrafficStatus','TrafficPauseBtn','TrafficTotalRate','TrafficProtoText',
                   'TrafficTcpBar','TrafficUdpBar','TrafficIcmpBar',
@@ -12553,6 +12575,7 @@ function Refresh-History {
     Load-Sessions
     Redraw-Heatmap
     Update-HistorySummary
+    try { Redraw-WifiRoamingTimeline } catch {}
 }
 
 # Tier 36: compute summary stats from $script:Sessions and populate the HISTORY summary card.
@@ -16794,6 +16817,36 @@ function Tick-AutoEmitters {
         try { Update-DnsCache } catch {}
         $script:State.LastDnsAutoPoll = $now
     }
+
+    # ---- Latency anomaly detection (v1.3) ----
+    # Throttled to once every 60s. Fires INFO when the last-5-sample mean is > 2x the 60-sample
+    # baseline on either Gateway or Cloudflare ping series. Useful early indicator of latency
+    # spikes (ISP issues, neighbor network congestion, AP saturation, etc.) before they're bad
+    # enough to register as a flap.
+    if (-not $script:_LastLatencyAnomalyAt) { $script:_LastLatencyAnomalyAt = [DateTime]::MinValue }
+    if (($now - $script:_LastLatencyAnomalyAt).TotalSeconds -ge 60) {
+        $script:_LastLatencyAnomalyAt = $now
+        try {
+            $checkSeries = @(
+                @{ Name = 'Gateway';    Hist = $script:State.GwHistory }
+                @{ Name = 'Cloudflare'; Hist = $script:State.CfHistory }
+            )
+            foreach ($s in $checkSeries) {
+                $h = $s.Hist
+                if ($null -eq $h -or $h.Count -lt 10) { continue }
+                # Skip if too many null/lost samples in the recent window.
+                $recent = @($h | Select-Object -Last 5 | Where-Object { $null -ne $_ -and $_ -gt 0 })
+                $base   = @($h | Where-Object { $null -ne $_ -and $_ -gt 0 })
+                if ($recent.Count -lt 3 -or $base.Count -lt 10) { continue }
+                $meanRecent = ($recent | Measure-Object -Average).Average
+                $meanBase   = ($base   | Measure-Object -Average).Average
+                if ($meanBase -le 0) { continue }
+                if ($meanRecent -gt ($meanBase * 2.0) -and $meanRecent -ge 50) {
+                    Add-Event info ("Latency anomaly: {0} last-5 mean {1:N0}ms vs baseline {2:N0}ms ({3:N1}x)" -f $s.Name, $meanRecent, $meanBase, ($meanRecent / $meanBase))
+                }
+            }
+        } catch {}
+    }
     # FLOWS summary - emit "N new / M closed in last 30s" so the feed shows activity
     if (($now - $script:State.LastFlowSummary).TotalSeconds -ge 30) {
         try {
@@ -18700,6 +18753,9 @@ if ($controls.MenuSubnetScan) {
         } catch { Add-Event warn ("Subnet scan failed to start: $($_.Exception.Message)") }
     })
 }
+if ($controls.MenuSnapshotDiff) {
+    $controls.MenuSnapshotDiff.Add_Click({ try { Show-SnapshotDiffDialog } catch { Add-Event warn ("Snapshot diff failed: $($_.Exception.Message)") } })
+}
 $controls.MenuFlapTimeline.Add_Click({ Show-FlapTimeline })
 
 # --- Remediate menu items ---
@@ -18793,6 +18849,9 @@ if ($controls.MenuReplaySnapshot) {
     $controls.MenuReplaySnapshot.Add_Click({
         try { Show-ReplaySnapshotDialog } catch { Add-Event warn ("Replay dialog failed: $($_.Exception.Message)") }
     })
+}
+if ($controls.MenuLedgerSearch) {
+    $controls.MenuLedgerSearch.Add_Click({ try { Show-LedgerSearchDialog } catch { Add-Event warn ("Ledger search dialog failed: $($_.Exception.Message)") } })
 }
 $controls.MenuOpenRules.Add_Click({
     if (-not (Test-Path $script:RulesDir)) { New-Item -ItemType Directory -Path $script:RulesDir | Out-Null }
