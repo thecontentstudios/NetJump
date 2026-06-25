@@ -89,6 +89,50 @@ function Start-PktmonPreset {
     $t.Start()
 }
 
+# Triggered from the threat-intel scan section when one or more hits are detected. Starts a
+# focused 60-second capture filtered to the offending remote IPs (up to 5) so the user has
+# packet evidence for a SOC ticket. Throttled to once per hour so a repeating beacon doesn't
+# trigger back-to-back captures.
+$script:_LastThreatIntelCaptureAt = [DateTime]::MinValue
+function Start-ThreatIntelPktmonCapture {
+    param([Parameter(Mandatory)] $Hits)
+    if (-not $script:HasPktmon -or -not $script:IsAdmin) { return }
+    if ($script:_PktmonPresetActive) { return }   # don't fight an existing preset capture
+    if (((Get-Date) - $script:_LastThreatIntelCaptureAt).TotalMinutes -lt 60) { return }
+    $script:_LastThreatIntelCaptureAt = Get-Date
+
+    $ips = @($Hits | ForEach-Object { [string]$_.Ip } | Where-Object { $_ } | Select-Object -Unique | Select-Object -First 5)
+    if ($ips.Count -eq 0) { return }
+    try { Stop-PktmonCapture } catch {}
+    _Pktmon-Stop-Quiet
+    _Pktmon-FilterReset
+    foreach ($ip in $ips) {
+        try { & pktmon filter add -i $ip 2>&1 | Out-Null } catch {}
+    }
+    $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+    $folder = Join-Path $script:FlapsRoot ("threat-intel-$stamp")
+    if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+    $outPath = Join-Path $folder ("capture-$stamp.etl")
+    try {
+        & pktmon start --capture --pkt-size 0 --file-name $outPath 2>&1 | Out-Null
+        @{
+            timestamp = (Get-Date).ToString('o')
+            host      = $env:COMPUTERNAME
+            triggerIps = $ips
+            hits      = $Hits
+        } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $folder 'manifest.json') -Encoding UTF8
+        Add-Event warn ("Threat-intel pktmon capture starting for $($ips.Count) IP(s): $($ips -join ', '). Saving to $(Split-Path $folder -Leaf)\")
+    } catch {
+        Add-Event warn ("Threat-intel pktmon capture failed to start: $($_.Exception.Message)")
+        return
+    }
+    $script:_PktmonPresetActive = @{ Path=$outPath; StopAt=(Get-Date).AddSeconds(60); PresetName='ThreatIntel' }
+    $t = New-Object System.Windows.Threading.DispatcherTimer
+    $t.Interval = [TimeSpan]::FromSeconds(60)
+    $t.Add_Tick({ try { $this.Stop() } catch {}; Stop-PktmonPreset }.GetNewClosure())
+    $t.Start()
+}
+
 function Stop-PktmonPreset {
     if (-not $script:_PktmonPresetActive) { return }
     $info = $script:_PktmonPresetActive

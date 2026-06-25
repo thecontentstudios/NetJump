@@ -45,6 +45,27 @@ jobs:
             "Parsed $script OK"
           }
 
+  pester:
+    name: Pester 5 unit tests
+    runs-on: windows-latest
+    needs: parse
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Pester 5 suite
+        shell: pwsh
+        run: |
+          .\tests\Run-Tests.ps1 -NunitXmlPath .\test-results.xml -FailNoTests
+
+      - name: Upload NUnit-XML test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pester-results-${{ github.sha }}
+          path: test-results.xml
+          if-no-files-found: warn
+          retention-days: 30
+
   headless-smoke-test:
     name: Headless -Json smoke test
     runs-on: windows-latest
@@ -82,7 +103,7 @@ jobs:
   build-installer:
     name: Build Inno Setup installer
     runs-on: windows-latest
-    needs: [parse, headless-smoke-test]
+    needs: [parse, pester, headless-smoke-test]
     steps:
       - uses: actions/checkout@v4
 

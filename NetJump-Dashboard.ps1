@@ -9638,6 +9638,8 @@ function Save-FlapDossier {
                         ToolTip="Exports the rows visible in whichever tab is currently active (Diagnostics, Processes, Persistence, DNS, Traffic, History). For piping into Excel / SIEM / etc."/>
               <MenuItem x:Name="MenuExportLedger" Header="Export connection ledger as CSV"
                         ToolTip="Dumps the long-running beacon/connection ledger - every (process, remote IP, port) combination NetJump has seen, with first/last-seen and sample count. Survives across launches; pruned to 7 days."/>
+              <MenuItem x:Name="MenuComplianceReport" Header="Compliance report (HTML)..."
+                        ToolTip="Render the current findings against NIST CSF 2.0 + CIS Critical Controls v8 in a single self-contained HTML file. Saved to Reports\Compliance\. Useful for audits / change tickets."/>
               <MenuItem x:Name="MenuLedgerSearch" Header="Search ledger..."
                         ToolTip="Searchable view of the connection ledger with country / threat-intel enrichment. Type a process name, IP, port, country code, or threat tag to filter."/>
               <MenuItem x:Name="MenuExportStix"   Header="Export STIX 2.1 bundle (SOC handoff)"
@@ -9858,7 +9860,7 @@ foreach ($name in 'Dot','DotGlow','AdapterCombo','AdapterDesc','StatusText','Lin
                   'MenuDriver','MenuNetReset','MenuIpv6','MenuLockdownOn','MenuLockdownOff',
                   'MenuMonitorInstall','MenuMonitorUninstall','MenuOpenRules',
                   'LockdownBadge','LockdownText',
-                  'MenuSaveHtml','MenuExportCsv','MenuExportLedger','MenuLedgerSearch','MenuExportStix','MenuDigest','MenuBundle','MenuOpenReports','MenuReplaySnapshot',
+                  'MenuSaveHtml','MenuExportCsv','MenuExportLedger','MenuLedgerSearch','MenuComplianceReport','MenuExportStix','MenuDigest','MenuBundle','MenuOpenReports','MenuReplaySnapshot',
                   'MenuTheme','MenuMute','MenuProcTree','MenuViewEvents','MenuClearEvents','MenuSettings','MenuMitreCoverage','MenuSubnetScan','MenuKeyboardShortcuts','MenuUnblockAllRules','MenuSnapshotDiff','MenuPktmonDns','MenuPktmonTls','MenuPktmonIcmp','MenuPktmonStop','MenuNistCsf','MenuCisControls',
                   'RescanButton','OpenReportsButton','FixButton',
                   'KillSwitchPanel','KillSwitchArmHost','KillSwitchRevertHost','KillSwitchArmBtn','KillSwitchRevertBtn','KillSwitchRevertSubtext',
@@ -11314,6 +11316,9 @@ function Update-Findings {
                     "The remote IP appeared in a public threat-intel feed (FireHOL Level1 = aggregate of widely-trusted blocklists; Feodo Tracker = active C2/botnet IPs). Hits warrant immediate action." `
                     'threat-intel'))
             }
+            # v1.4: auto-pktmon snapshot. Throttled to once per hour so we don't fire repeatedly
+            # for the same connection. Captures 60 seconds + filters to the suspect IP(s).
+            try { Start-ThreatIntelPktmonCapture -Hits $hits } catch {}
         } else {
             $script:Findings.Add((Add-Finding 'OK' 'ThreatIntel' ("Threat-intel: no hits across {0} ledger entries (vs {1} ranges + {2} IPs)" -f $script:Ledger.Count, $script:ThreatIntelRanges.Count, $script:ThreatIntelHashSet.Count)))
         }
@@ -11390,6 +11395,11 @@ function Update-Findings {
                 $dllFinds = @(Get-SysmonDllHijackFindings -Minutes 30 -Max 3000)
                 foreach ($df in $dllFinds) { $script:Findings.Add($df) }
             } catch { try { Add-Event warn ("Sysmon DLL hijack findings failed: $($_.Exception.Message)") } catch {} }
+            # v1.4: Sysmon Event 1 process-create anomaly detection - Office macro spawn + LOLBin chains.
+            try {
+                $procFinds = @(Get-SysmonProcessCreateFindings -Minutes 30 -Max 3000)
+                foreach ($df in $procFinds) { $script:Findings.Add($df) }
+            } catch { try { Add-Event warn ("Sysmon ProcessCreate findings failed: $($_.Exception.Message)") } catch {} }
         } else {
             $script:Findings.Add((Add-Finding 'WARN' 'Sysmon' ("Sysmon installed but {0}." -f $sm.Status) "Start-Service $($sm.Name)"))
         }
@@ -18915,6 +18925,9 @@ if ($controls.MenuReplaySnapshot) {
 }
 if ($controls.MenuLedgerSearch) {
     $controls.MenuLedgerSearch.Add_Click({ try { Show-LedgerSearchDialog } catch { Add-Event warn ("Ledger search dialog failed: $($_.Exception.Message)") } })
+}
+if ($controls.MenuComplianceReport) {
+    $controls.MenuComplianceReport.Add_Click({ try { Export-ComplianceReport | Out-Null } catch { Add-Event warn ("Compliance report failed: $($_.Exception.Message)") } })
 }
 $controls.MenuOpenRules.Add_Click({
     if (-not (Test-Path $script:RulesDir)) { New-Item -ItemType Directory -Path $script:RulesDir | Out-Null }

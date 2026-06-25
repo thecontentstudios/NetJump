@@ -6,6 +6,18 @@ This project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (v1.4 roadmap)
+- **Kernel-mode driver enumeration** scan check (`src/30-kernel-driver-and-boot.ps1`). Lists every running kernel driver and Authenticode-signs each, buckets into MS-signed / 3rd-party-signed (INFO with name+signer) / unsigned (WARN).
+- **Secure Boot / TPM / VBS / HVCI posture** scan check (same module). Surfaces `Confirm-SecureBootUEFI` + `Get-Tpm` + `Win32_DeviceGuard` as OK/WARN findings with one-line fixes.
+- **Sysmon Event 1 (ProcessCreate) suspicious-child detector** (`src/32-sysmon-process-create.ps1`). Flags Office maldoc spawn (WINWORD → cmd/powershell) and LOLBin chains (cmd → curl/certutil/bitsadmin/regsvr32) as WARN with command-line snippet.
+- **pktmon filter presets in Diagnose menu** (`src/45-pktmon-presets.ps1`). One-click 2-minute captures filtered to DNS (53/853/5353), TLS handshakes (443/853), or ICMP. Pauses the rolling NetJump capture, resets filters, auto-stops, then resumes rolling.
+- **Auto-pktmon on threat-intel hit** (same module). When the threat-intel scan section detects matches, fires a 60-second pktmon capture filtered to the suspect IPs (up to 5) and writes to `Reports\Flaps\threat-intel-{stamp}\` with a manifest. Throttled to once per hour.
+- **NIST CSF 2.0 + CIS Controls v8 coverage panels** (`src/86-compliance-mappings.ps1`). View menu → two new items render NetJump's detection rules against either framework with green/gray coverage pills. Shared `Show-ComplianceCoverageDialog -Framework NIST|CIS` core.
+- **Compliance report HTML export** (`src/87-compliance-report.ps1`). Export menu → "Compliance report (HTML)…" renders the current findings against both NIST CSF and CIS Controls in a self-contained HTML file saved to `Reports\Compliance\`. Suitable for audit ticket attachments.
+- **HTTP server bearer-token auth** (HTTP listener + `Update-HttpSnapshot`). Settings.HttpAuthToken = non-empty → `/status.json` / `/findings.json` / `/causes.json` / `/ledger.json` / `/metrics` all require `Authorization: Bearer <token>` (401 + `WWW-Authenticate` otherwise). `/health` stays anonymous for uptime probes.
+- **Pester 5 test scaffold + 12 tests** (`tests/`). `tests/Run-Tests.ps1` installs Pester 5 to CurrentUser scope if missing, runs the suite, optionally writes NUnit-XML. Three test files cover GeoIP binary search + CSV parser (10 tests), compliance framework integrity (4 tests), and Defender exclusion audit (4 tests).
+- **CI: Pester runs on every push/PR** (`.github/workflows/ci.yml`). New `pester` job runs after `parse`; the `build-installer` job now waits for `parse + pester + headless-smoke-test`. Test results uploaded as a NUnit-XML artifact for inspection.
+
 ### Added (v1.3 roadmap)
 - **Module migration kickoff**: GeoIP block (`Update-GeoIpDatabase`, `Load-GeoIpDatabase`, `Get-IpCountry`) extracted to `src/22-geoip.ps1` as the proof-of-pattern for the gradual `src/` migration. The dot-source loader moved from end-of-file to right after `Add-Type` so extracted modules' functions are visible to the main file's init code. Source-of-truth is the main `NetJump-Dashboard.ps1` — `src/` files dot-source on top.
 - **Defender exclusion offered at install** — `NetJump.iss` Tasks page now has an opt-in "Add Microsoft Defender exclusion for the install folder (recommended)" checkbox. The `[Run]` section calls `Add-MpPreference -ExclusionPath` for `{app}` when ticked; the `[UninstallRun]` removes it cleanly. Mirrors the standard practice for legitimate SOC tooling (Wireshark / BloodHound).
