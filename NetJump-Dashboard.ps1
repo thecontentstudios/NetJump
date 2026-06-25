@@ -9590,6 +9590,13 @@ function Save-FlapDossier {
               <Separator/>
               <MenuItem x:Name="MenuConnMap"   Header="Show connection map..."
                         ToolTip="Visualizes all current outbound TCP connections grouped by remote IP, with country/ASN labels. Quick way to see who you're talking to right now."/>
+              <MenuItem Header="Capture: pktmon preset...">
+                <MenuItem x:Name="MenuPktmonDns"  Header="DNS only (port 53 / 853 / 5353) - 2 min"/>
+                <MenuItem x:Name="MenuPktmonTls"  Header="TLS handshakes only (port 443 / 853) - 2 min"/>
+                <MenuItem x:Name="MenuPktmonIcmp" Header="ICMP only (v4 + v6) - 2 min"/>
+                <Separator/>
+                <MenuItem x:Name="MenuPktmonStop" Header="Stop preset capture now"/>
+              </MenuItem>
               <MenuItem x:Name="MenuSnapshotDiff" Header="Diff two snapshots..."
                         ToolTip="Pick two snapshot JSONs from Reports\Snapshots\ - the diff viewer shows findings ONLY IN A (resolved since A), ONLY IN B (appeared since A), and IN BOTH. Useful for 'what changed since Monday?' investigations."/>
               <MenuItem x:Name="MenuSubnetScan" Header="Subnet scan (discover LAN neighbors)..."
@@ -9664,6 +9671,10 @@ function Save-FlapDossier {
                         ToolTip="Show which MITRE ATT&amp;CK techniques NetJump can detect, grouped by tactic. Green pills = covered today."/>
               <MenuItem x:Name="MenuKeyboardShortcuts" Header="Keyboard shortcuts..."
                         ToolTip="Show every keyboard binding in the HUD (Ctrl+/, Ctrl+R, F5, etc.). Also available via Ctrl+/."/>
+              <MenuItem x:Name="MenuNistCsf" Header="NIST CSF 2.0 coverage..."
+                        ToolTip="Map NetJump's detection rules to NIST Cybersecurity Framework 2.0 subcategories. 6 functions x representative subcategories grid."/>
+              <MenuItem x:Name="MenuCisControls" Header="CIS Critical Controls v8 coverage..."
+                        ToolTip="Map NetJump's detection rules to CIS Critical Security Controls v8 (top-level controls)."/>
               <MenuItem x:Name="MenuClearEvents" Header="Clear events log  (Ctrl+L)"/>
               <Separator/>
               <MenuItem x:Name="MenuSettings"   Header="Settings..."/>
@@ -9848,7 +9859,7 @@ foreach ($name in 'Dot','DotGlow','AdapterCombo','AdapterDesc','StatusText','Lin
                   'MenuMonitorInstall','MenuMonitorUninstall','MenuOpenRules',
                   'LockdownBadge','LockdownText',
                   'MenuSaveHtml','MenuExportCsv','MenuExportLedger','MenuLedgerSearch','MenuExportStix','MenuDigest','MenuBundle','MenuOpenReports','MenuReplaySnapshot',
-                  'MenuTheme','MenuMute','MenuProcTree','MenuViewEvents','MenuClearEvents','MenuSettings','MenuMitreCoverage','MenuSubnetScan','MenuKeyboardShortcuts','MenuUnblockAllRules','MenuSnapshotDiff',
+                  'MenuTheme','MenuMute','MenuProcTree','MenuViewEvents','MenuClearEvents','MenuSettings','MenuMitreCoverage','MenuSubnetScan','MenuKeyboardShortcuts','MenuUnblockAllRules','MenuSnapshotDiff','MenuPktmonDns','MenuPktmonTls','MenuPktmonIcmp','MenuPktmonStop','MenuNistCsf','MenuCisControls',
                   'RescanButton','OpenReportsButton','FixButton',
                   'KillSwitchPanel','KillSwitchArmHost','KillSwitchRevertHost','KillSwitchArmBtn','KillSwitchRevertBtn','KillSwitchRevertSubtext',
                   'KillSwitchIcon','KillSwitchLabel','KillSwitchSubtext',
@@ -11388,6 +11399,17 @@ function Update-Findings {
             'Sysmon writes detailed events to Microsoft-Windows-Sysmon/Operational. Pair it with a config from SwiftOnSecurity or Olaf Hartong - the HUD will surface its events here once both are present.'))
     }
     } catch { try { Add-Event warn ("Section 'sysmon' failed: $($_.Exception.Message)") } catch {} }
+
+    # v1.4: kernel driver enumeration + boot posture (Secure Boot / TPM / VBS / HVCI). Both live
+    # in src/30-kernel-driver-and-boot.ps1.
+    _ScanYield 'Scanning: kernel drivers + boot posture...'
+    try {
+        foreach ($f in @(Get-LoadedKernelDriverFindings)) { $script:Findings.Add($f) }
+    } catch { try { Add-Event warn ("Section 'kernel drivers' failed: $($_.Exception.Message)") } catch {} }
+    try {
+        foreach ($f in @(Get-BootPostureFindings)) { $script:Findings.Add($f) }
+    } catch { try { Add-Event warn ("Section 'boot posture' failed: $($_.Exception.Message)") } catch {} }
+    _RebuildAndFilter
 
     # v1.3: Defender exclusion audit + LSA Auth/Notification Packages check. Both implemented in
     # src/31-security-audits.ps1; cheap and read-only.
@@ -14935,6 +14957,10 @@ function Update-HttpSnapshot {
     $a = $script:State.Adapter
     $script:HttpSnapshot['ts']            = (Get-Date).ToString('o')
     $script:HttpSnapshot['host']          = $env:COMPUTERNAME
+    # v1.4: bearer auth token. Empty = anonymous mode (current behavior). Non-empty = required
+    # on every endpoint except /health. Read fresh each snapshot so toggling in Settings takes
+    # effect on the next HTTP request without restarting the listener.
+    $script:HttpSnapshot['authToken']     = if ($script:State.Settings -and $script:State.Settings.HttpAuthToken) { [string]$script:State.Settings.HttpAuthToken } else { '' }
     $script:HttpSnapshot['adapter']       = if ($a) { @{name=$a.Name; status=[string]$a.Status; linkSpeed=$a.LinkSpeed; description=$a.InterfaceDescription} } else { $null }
     $script:HttpSnapshot['gateway']       = $script:State.Gateway
     $script:HttpSnapshot['flapsSession']  = $script:State.FlapCount
@@ -15019,6 +15045,28 @@ function Start-HttpServer {
                 $body = ''
                 $contentType = 'application/json'
                 $code = 200
+                # v1.4: opt-in bearer-token auth. Set $script:State.Settings.HttpAuthToken to
+                # any non-empty string and all endpoints except '/health' require an
+                # 'Authorization: Bearer <token>' header. /health stays anonymous so localhost
+                # probes (kubelet liveness, uptime monitors) still work.
+                $reqPath = [string]$req.Url.AbsolutePath
+                if ($snap.ContainsKey('authToken') -and $snap['authToken'] -and $reqPath -ne '/health') {
+                    $hdr = [string]$req.Headers['Authorization']
+                    $expected = "Bearer " + [string]$snap['authToken']
+                    if ($hdr -ne $expected) {
+                        $body = 'Unauthorized'
+                        $code = 401
+                        $contentType = 'text/plain'
+                        $res.StatusCode = $code
+                        $res.ContentType = $contentType
+                        $res.Headers.Add('WWW-Authenticate', 'Bearer realm="NetJump"')
+                        $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+                        $res.ContentLength64 = $bytes.Length
+                        $res.OutputStream.Write($bytes, 0, $bytes.Length)
+                        $res.OutputStream.Close()
+                        continue
+                    }
+                }
                 switch -Wildcard ($req.Url.AbsolutePath) {
                     '/status.json' { $body = $snap | ConvertTo-Json -Depth 5 }
                     '/health' {
@@ -18767,6 +18815,10 @@ if ($controls.MenuSubnetScan) {
 if ($controls.MenuSnapshotDiff) {
     $controls.MenuSnapshotDiff.Add_Click({ try { Show-SnapshotDiffDialog } catch { Add-Event warn ("Snapshot diff failed: $($_.Exception.Message)") } })
 }
+if ($controls.MenuPktmonDns)  { $controls.MenuPktmonDns.Add_Click({ try { Start-PktmonPreset -Preset DNS } catch { Add-Event warn ("pktmon DNS preset failed: $($_.Exception.Message)") } }) }
+if ($controls.MenuPktmonTls)  { $controls.MenuPktmonTls.Add_Click({ try { Start-PktmonPreset -Preset TLS } catch { Add-Event warn ("pktmon TLS preset failed: $($_.Exception.Message)") } }) }
+if ($controls.MenuPktmonIcmp) { $controls.MenuPktmonIcmp.Add_Click({ try { Start-PktmonPreset -Preset ICMP } catch { Add-Event warn ("pktmon ICMP preset failed: $($_.Exception.Message)") } }) }
+if ($controls.MenuPktmonStop) { $controls.MenuPktmonStop.Add_Click({ try { Stop-PktmonPreset } catch { Add-Event warn ("pktmon stop failed: $($_.Exception.Message)") } }) }
 $controls.MenuFlapTimeline.Add_Click({ Show-FlapTimeline })
 
 # --- Remediate menu items ---
@@ -18893,6 +18945,8 @@ $controls.MenuProcTree.Add_Click({ Show-ProcessTree })
 $controls.MenuViewEvents.Add_Click({ Show-EventsLogDialog })
 if ($controls.MenuMitreCoverage) { $controls.MenuMitreCoverage.Add_Click({ try { Show-MitreCoverageDialog } catch { Add-Event warn ("MITRE coverage dialog failed: $($_.Exception.Message)") } }) }
 if ($controls.MenuKeyboardShortcuts) { $controls.MenuKeyboardShortcuts.Add_Click({ try { Show-KeyboardShortcutsDialog } catch { Add-Event warn ("Keyboard shortcuts dialog failed: $($_.Exception.Message)") } }) }
+if ($controls.MenuNistCsf)     { $controls.MenuNistCsf.Add_Click({ try { Show-ComplianceCoverageDialog -Framework NIST } catch { Add-Event warn ("NIST CSF dialog failed: $($_.Exception.Message)") } }) }
+if ($controls.MenuCisControls) { $controls.MenuCisControls.Add_Click({ try { Show-ComplianceCoverageDialog -Framework CIS  } catch { Add-Event warn ("CIS Controls dialog failed: $($_.Exception.Message)") } }) }
 $controls.MenuClearEvents.Add_Click({ $script:Events.Clear() })
 # Tier 34: wire the LIVE EVENTS panel's own Clear button (it was previously orphaned - silently no-op).
 if ($controls.ClearEventsButton) {
