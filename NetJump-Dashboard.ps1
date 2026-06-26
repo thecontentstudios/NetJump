@@ -9673,6 +9673,8 @@ function Save-FlapDossier {
                         ToolTip="Show which MITRE ATT&amp;CK techniques NetJump can detect, grouped by tactic. Green pills = covered today."/>
               <MenuItem x:Name="MenuKeyboardShortcuts" Header="Keyboard shortcuts..."
                         ToolTip="Show every keyboard binding in the HUD (Ctrl+/, Ctrl+R, F5, etc.). Also available via Ctrl+/."/>
+              <MenuItem x:Name="MenuManageSuppressed" Header="Manage suppressed findings..."
+                        ToolTip="View every finding you've suppressed via the DIAGNOSTICS right-click menu. Bulk-remove entries from the allowlist."/>
               <MenuItem x:Name="MenuNistCsf" Header="NIST CSF 2.0 coverage..."
                         ToolTip="Map NetJump's detection rules to NIST Cybersecurity Framework 2.0 subcategories. 6 functions x representative subcategories grid."/>
               <MenuItem x:Name="MenuCisControls" Header="CIS Critical Controls v8 coverage..."
@@ -9861,7 +9863,7 @@ foreach ($name in 'Dot','DotGlow','AdapterCombo','AdapterDesc','StatusText','Lin
                   'MenuMonitorInstall','MenuMonitorUninstall','MenuOpenRules',
                   'LockdownBadge','LockdownText',
                   'MenuSaveHtml','MenuExportCsv','MenuExportLedger','MenuLedgerSearch','MenuComplianceReport','MenuExportStix','MenuDigest','MenuBundle','MenuOpenReports','MenuReplaySnapshot',
-                  'MenuTheme','MenuMute','MenuProcTree','MenuViewEvents','MenuClearEvents','MenuSettings','MenuMitreCoverage','MenuSubnetScan','MenuKeyboardShortcuts','MenuUnblockAllRules','MenuSnapshotDiff','MenuPktmonDns','MenuPktmonTls','MenuPktmonIcmp','MenuPktmonStop','MenuNistCsf','MenuCisControls',
+                  'MenuTheme','MenuMute','MenuProcTree','MenuViewEvents','MenuClearEvents','MenuSettings','MenuMitreCoverage','MenuSubnetScan','MenuKeyboardShortcuts','MenuUnblockAllRules','MenuSnapshotDiff','MenuPktmonDns','MenuPktmonTls','MenuPktmonIcmp','MenuPktmonStop','MenuNistCsf','MenuCisControls','MenuManageSuppressed',
                   'RescanButton','OpenReportsButton','FixButton',
                   'KillSwitchPanel','KillSwitchArmHost','KillSwitchRevertHost','KillSwitchArmBtn','KillSwitchRevertBtn','KillSwitchRevertSubtext',
                   'KillSwitchIcon','KillSwitchLabel','KillSwitchSubtext',
@@ -11420,6 +11422,21 @@ function Update-Findings {
         foreach ($f in @(Get-WindowsUpdateFindings)) { $script:Findings.Add($f) }
         foreach ($f in @(Get-SuspiciousPortFindings)){ $script:Findings.Add($f) }
     } catch { try { Add-Event warn ("Section 'posture' failed: $($_.Exception.Message)") } catch {} }
+    _RebuildAndFilter
+
+    # v1.5: scheduled task baseline diff (src/34).
+    _ScanYield 'Scanning: scheduled task baseline diff...'
+    try {
+        foreach ($f in @(Get-ScheduledTaskBaselineFindings)) { $script:Findings.Add($f) }
+    } catch { try { Add-Event warn ("Section 'scheduled task diff' failed: $($_.Exception.Message)") } catch {} }
+    _RebuildAndFilter
+
+    # v1.5: WMI persistence + AMSI bypass detection (src/35).
+    _ScanYield 'Scanning: WMI persistence + AMSI bypass...'
+    try {
+        foreach ($f in @(Get-WmiPersistenceFindings)) { $script:Findings.Add($f) }
+        foreach ($f in @(Get-AmsiBypassFindings))     { $script:Findings.Add($f) }
+    } catch { try { Add-Event warn ("Section 'evasion' failed: $($_.Exception.Message)") } catch {} }
     _RebuildAndFilter
 
     # v1.4: kernel driver enumeration + boot posture (Secure Boot / TPM / VBS / HVCI). Both live
@@ -18988,6 +19005,7 @@ if ($controls.MenuMitreCoverage) { $controls.MenuMitreCoverage.Add_Click({ try {
 if ($controls.MenuKeyboardShortcuts) { $controls.MenuKeyboardShortcuts.Add_Click({ try { Show-KeyboardShortcutsDialog } catch { Add-Event warn ("Keyboard shortcuts dialog failed: $($_.Exception.Message)") } }) }
 if ($controls.MenuNistCsf)     { $controls.MenuNistCsf.Add_Click({ try { Show-ComplianceCoverageDialog -Framework NIST } catch { Add-Event warn ("NIST CSF dialog failed: $($_.Exception.Message)") } }) }
 if ($controls.MenuCisControls) { $controls.MenuCisControls.Add_Click({ try { Show-ComplianceCoverageDialog -Framework CIS  } catch { Add-Event warn ("CIS Controls dialog failed: $($_.Exception.Message)") } }) }
+if ($controls.MenuManageSuppressed) { $controls.MenuManageSuppressed.Add_Click({ try { Show-SuppressedFindingsDialog } catch { Add-Event warn ("Suppressed findings dialog failed: $($_.Exception.Message)") } }) }
 $controls.MenuClearEvents.Add_Click({ $script:Events.Clear() })
 # Tier 34: wire the LIVE EVENTS panel's own Clear button (it was previously orphaned - silently no-op).
 if ($controls.ClearEventsButton) {
