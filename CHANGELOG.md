@@ -6,6 +6,20 @@ This project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (v1.5 roadmap)
+- **BitLocker posture scan** (`src/33-posture-and-forensics.ps1`). Surfaces volume status + encryption method + key protector chain. Decrypted system drive = WARN.
+- **Windows Update posture scan** (same module). `Win32_QuickFixEngineering` age check: >60 d = FAIL, >30 d = WARN.
+- **Suspicious-port listening check** (same module). Cross-references `Get-NetTCPConnection -State Listen` against a curated C2 port list (1080 / 1337 / 3333 / 4444 / 5555 / 6666 / 7777 / 8888 / 9001 / 9050 / 12345 / 31337).
+- **PowerShell `-EncodedCommand` decoder** (`Decode-EncodedPowerShellCommand` in `src/33`). Sysmon Event 1 detector now appends the decoded plaintext to the finding Detail field when the suspect command-line uses `-EncodedCommand`, `-enc`, `-ec`, or `-e`.
+- **IP-to-ASN lookup** (`src/23-ip-asn.ps1`). DB-IP ASN Lite CSV (free monthly download). `Get-IpAsn` does the binary search. Ledger search dialog gains an `ASN` column rendering `AS<num>  <org-name>`.
+- **Scheduled task baseline diff** (`src/34-scheduled-task-baseline.ps1`). Daily snapshot of non-disabled scheduled tasks; diff vs the most-recent older baseline flags NEW entries as WARN. Filters out routine Microsoft Update / Defender / Servicing task paths.
+- **WMI persistence subscription enumeration** (`src/35-evasion-checks.ps1`). Reads `root\subscription` for `__EventConsumer` / `__EventFilter` / `__FilterToConsumerBinding`; everything outside a curated Microsoft allowlist surfaces as WARN.
+- **AMSI bypass detection** (same module). P/Invoke `GetProcAddress('AmsiScanBuffer')` and read first 8 bytes; compare against well-known patcher signatures (E_INVALIDARG immediate-return prologue). FAIL when matched.
+- **Manage suppressed findings dialog** (`src/84-suppressed-findings-ui.ps1`). View menu → list of every currently-suppressed finding with mode + expiry; "Unsuppress selected" / "Unsuppress ALL".
+- **5 more Pester tests** (`tests/Tests.PostureForensics.ps1`). Covers `Decode-EncodedPowerShellCommand` (4 tests) and `Get-IpAsn` binary search (4 tests).
+- **Settings dialog reorganized into tabs**: General / Threat-intel / Scheduled scans / HTTP auth. The HTTP-auth tab includes the v1.4 bearer-token field (previously hidden behind manual JSON editing).
+- **Vulnerable-driver block migrated to `src/21-vuln-drivers.ps1`** (continuation of the gradual src/ migration started in v1.3). The threat-intel core (`Update`/`Load`/`Save-ThreatIntel`, `Test-IpThreat`) is deferred to v1.6 — bigger chunk, safer in its own focused migration.
+
 ### Added (v1.4 roadmap)
 - **Kernel-mode driver enumeration** scan check (`src/30-kernel-driver-and-boot.ps1`). Lists every running kernel driver and Authenticode-signs each, buckets into MS-signed / 3rd-party-signed (INFO with name+signer) / unsigned (WARN).
 - **Secure Boot / TPM / VBS / HVCI posture** scan check (same module). Surfaces `Confirm-SecureBootUEFI` + `Get-Tpm` + `Win32_DeviceGuard` as OK/WARN findings with one-line fixes.

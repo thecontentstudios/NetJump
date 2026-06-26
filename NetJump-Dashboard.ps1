@@ -1566,134 +1566,8 @@ $script:ByovdBlocklist = @{
 }
 
 # ---------- Dynamic vulnerable-driver list (loldrivers.io) ----------
-# Augments the curated $script:ByovdBlocklist above with a regularly-refreshed list pulled from
-# https://www.loldrivers.io/api/drivers.json (the README has been advertising this since launch).
-# Curated entries always win on name collision because their Vendor/CVE/Note text is hand-written
-# and richer. Dynamic list adds long-tail entries (4-500 typically) we don't want to hand-maintain.
-$script:VulnDriverCache      = Join-Path $script:ThreatIntelDir 'loldrivers.json'
-$script:VulnDriverTtlHours   = 168    # 7-day TTL - the list moves slowly; weekly refresh is plenty.
-$script:VulnDriverFeedUrl    = 'https://www.loldrivers.io/api/drivers.json'
-$script:VulnDriverDynamic    = @{}    # filename(lowercase .sys) -> @{Vendor;CVE;Note;Source}
-$script:VulnDriverLoaded     = $false
-$script:VulnDriverLastRefresh = $null
-
-function Load-VulnerableDriverList {
-    $script:VulnDriverDynamic = @{}
-    $script:VulnDriverLoaded  = $false
-    if (-not (Test-Path $script:VulnDriverCache)) { return $false }
-    try {
-        $obj = Get-Content $script:VulnDriverCache -Raw | ConvertFrom-Json
-        if ($obj.timestamp) {
-            $age = (Get-Date) - [datetime]$obj.timestamp
-            # Allow up to 2x TTL for stale cache (i.e. 14 days) before we discard - the curated list
-            # remains useful past TTL, we just won't have the latest entries.
-            if ($age.TotalHours -gt ($script:VulnDriverTtlHours * 2)) { return $false }
-            $script:VulnDriverLastRefresh = [datetime]$obj.timestamp
-        }
-        if ($obj.drivers) {
-            foreach ($d in $obj.drivers) {
-                $name = ([string]$d.Filename).ToLower()
-                if (-not $name) { continue }
-                $script:VulnDriverDynamic[$name] = @{
-                    Vendor = [string]$d.Vendor
-                    CVE    = [string]$d.CVE
-                    Note   = [string]$d.Note
-                    Source = 'loldrivers'
-                }
-            }
-        }
-        $script:VulnDriverLoaded = $true
-        return $true
-    } catch { return $false }
-}
-
-function Save-VulnerableDriverList {
-    try {
-        $rows = @($script:VulnDriverDynamic.GetEnumerator() | ForEach-Object {
-            [pscustomobject]@{
-                Filename = $_.Key
-                Vendor   = $_.Value.Vendor
-                CVE      = $_.Value.CVE
-                Note     = $_.Value.Note
-            }
-        })
-        $obj = [pscustomobject]@{
-            timestamp = (Get-Date).ToString('o')
-            source    = $script:VulnDriverFeedUrl
-            count     = $rows.Count
-            drivers   = $rows
-        }
-        $obj | ConvertTo-Json -Depth 4 | Set-Content $script:VulnDriverCache -Encoding UTF8
-    } catch {
-        try { Add-Event warn ("Vulnerable-driver cache write failed: {0}" -f $_.Exception.Message) } catch {}
-    }
-}
-
-function Update-VulnerableDriverList {
-    # Async fetch (~600 KB JSON) via Start-Job to avoid blocking UI. Job parses each entry's
-    # KnownVulnerableSamples[].Filename and returns a hashtable. Tick polls for completion the
-    # same way it polls ThreatIntelJob, then calls Save-VulnerableDriverList.
-    if ($script:State -and $script:State.VulnDriverJob) {
-        Add-Event scan 'Vulnerable-driver list update already in progress.'
-        return
-    }
-    Add-Event scan 'Vulnerable-driver list: refreshing from loldrivers.io...'
-    $job = Start-Job -Name 'NetJump-VulnDrivers' -ScriptBlock {
-        param($Url)
-        try {
-            $r = Invoke-WebRequest -Uri $Url -TimeoutSec 60 -UseBasicParsing -ErrorAction Stop
-            # loldrivers.io JSON contains case-collision keys (e.g. 'init' AND 'INIT') that the
-            # default ConvertFrom-Json refuses to parse. JavaScriptSerializer is case-sensitive and
-            # ships in System.Web.Extensions on every Windows PowerShell install.
-            Add-Type -AssemblyName System.Web.Extensions
-            $ser = New-Object System.Web.Script.Serialization.JavaScriptSerializer
-            $ser.MaxJsonLength = [int]::MaxValue   # default 2 MB; the feed is ~30 MB.
-            $list = $ser.DeserializeObject($r.Content)
-            $out = @{}
-            foreach ($entry in @($list)) {
-                # CVE: pick first CVE-prefixed tag if present, else fall back to per-sample CVEs
-                $cveTag = $null
-                if ($entry['Tags']) {
-                    $cveTag = (@($entry['Tags']) | Where-Object { $_ -match '^CVE-' } | Select-Object -First 1)
-                }
-                if (-not $cveTag) {
-                    foreach ($s in @($entry['KnownVulnerableSamples'])) {
-                        if ($s -and $s['CVEs']) {
-                            $first = @($s['CVEs']) | Where-Object { $_ -match '^CVE-' } | Select-Object -First 1
-                            if ($first) { $cveTag = $first; break }
-                        }
-                    }
-                }
-                foreach ($s in @($entry['KnownVulnerableSamples'])) {
-                    if (-not $s -or -not $s['Filename']) { continue }
-                    $fn = ([string]$s['Filename']).ToLower().Trim()
-                    if ($fn -notmatch '\.sys$') { continue }   # kernel drivers only
-                    $vendor = if ($s['Company'])              { [string]$s['Company'] }
-                              elseif ($s['Product'])          { [string]$s['Product'] }
-                              elseif ($s['OriginalFilename']) { [string]$s['OriginalFilename'] }
-                              else { '' }
-                    $desc = if ($s['Description'])         { [string]$s['Description'] }
-                            elseif ($s['FileDescription']) { [string]$s['FileDescription'] }
-                            elseif ($entry['Category'])    { [string]$entry['Category'] }
-                            else { 'vulnerable driver (loldrivers.io)' }
-                    if ($desc.Length -gt 140) { $desc = $desc.Substring(0,140) + '...' }
-                    if (-not $out.ContainsKey($fn)) {
-                        $out[$fn] = @{
-                            Vendor = $vendor
-                            CVE    = if ($cveTag) { [string]$cveTag } else { 'multiple' }
-                            Note   = $desc
-                            Source = 'loldrivers'
-                        }
-                    }
-                }
-            }
-            return @{ Ok=$true; Drivers=$out; Count=$out.Count }
-        } catch {
-            return @{ Ok=$false; Error="$_"; Count=0 }
-        }
-    } -ArgumentList $script:VulnDriverFeedUrl
-    if ($script:State) { $script:State.VulnDriverJob = $job }
-}
+# Moved to src/21-vuln-drivers.ps1 in v1.5 as part of the gradual module migration.
+# Loaded by the dot-source loader at the top of this file before any code below runs.
 
 function Scan-ByovdDrivers {
     $hits = New-Object System.Collections.ArrayList
@@ -15586,64 +15460,78 @@ function Show-SettingsDialog {
     [xml]$x = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="NetJump Settings" Width="640" Height="620" WindowStartupLocation="CenterOwner"
+        Title="NetJump Settings" Width="700" Height="640" WindowStartupLocation="CenterOwner"
         Background="{DynamicResource BrushWindowBg}" Foreground="{DynamicResource BrushFgPrimary}" FontFamily="Segoe UI">
     <Grid Margin="18">
         <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
-        <TextBlock Grid.Row="0" Text="HTTP STATUS PORT" Foreground="{DynamicResource BrushFgMuted}" FontSize="11" Margin="0,0,0,4"/>
-        <TextBox  Grid.Row="1" x:Name="PortBox" Background="{DynamicResource BrushCardBg}" Foreground="{DynamicResource BrushFgPrimary}" BorderBrush="{DynamicResource BrushBorder}" Padding="8,5" Margin="0,0,0,12" CaretBrush="#58a6ff"
-                  ToolTip="HTTP server listens on http://localhost:port/. Endpoints: /status.json /health /findings.json /metrics (Prometheus)"/>
-        <TextBlock Grid.Row="2" Text="WEBHOOK URL  (POSTed JSON on every flap)" Foreground="{DynamicResource BrushFgMuted}" FontSize="11" Margin="0,0,0,4"/>
-        <TextBox  Grid.Row="3" x:Name="WebhookBox" Background="{DynamicResource BrushCardBg}" Foreground="{DynamicResource BrushFgPrimary}" BorderBrush="{DynamicResource BrushBorder}" Padding="8,5" Margin="0,0,0,4" CaretBrush="#58a6ff"/>
-        <TextBlock Grid.Row="4" Text="Examples:  https://hooks.slack.com/services/...  -or-  https://ntfy.sh/your-topic" Foreground="{DynamicResource BrushFgFaint}" FontSize="10" Margin="0,0,0,12"/>
-        <Grid Grid.Row="5" Margin="0,0,0,12">
-          <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="*"/>
-            <ColumnDefinition Width="Auto"/>
-          </Grid.ColumnDefinitions>
-          <CheckBox Grid.Column="0" x:Name="ThreatIntelCheck" Foreground="{DynamicResource BrushFgPrimary}" VerticalAlignment="Top">
-            <StackPanel>
-              <TextBlock x:Name="ThreatIntelLabel" Text="Threat-intel feeds" FontSize="13" FontWeight="SemiBold"/>
-              <TextBlock Text="OPT-IN. Downloads public IP blocklists every 24h and cross-references the connection ledger against them. Hits surface as FAIL findings with the T1071 ATT&amp;CK chip." Foreground="{DynamicResource BrushFgFaint}" FontSize="10" TextWrapping="Wrap" MaxWidth="430"/>
-              <TextBlock x:Name="ThreatIntelStatus" Text="" Foreground="{DynamicResource BrushFgFaint}" FontSize="10" Margin="0,4,0,0"/>
-            </StackPanel>
-          </CheckBox>
-          <Button Grid.Column="1" x:Name="ManageFeedsBtn" Content="Manage feeds..." Padding="10,4" VerticalAlignment="Top" Margin="10,0,0,0" Background="{DynamicResource BrushBorder}" Foreground="{DynamicResource BrushFgPrimary}" BorderBrush="{DynamicResource BrushHoverBg}"/>
-        </Grid>
-        <StackPanel Grid.Row="6" Margin="0,0,0,4">
-          <Border BorderBrush="{DynamicResource BrushBorder}" BorderThickness="0,1,0,0" Margin="0,0,0,10"/>
-          <TextBlock Text="ADVANCED" Foreground="#58a6ff" FontSize="10" FontWeight="Bold" Margin="0,0,0,6"/>
-          <CheckBox x:Name="VulnDriverCheck" Foreground="{DynamicResource BrushFgPrimary}" Margin="0,0,0,10">
-            <StackPanel>
-              <TextBlock x:Name="VulnDriverLabel" Text="Vulnerable-driver list (loldrivers.io)" FontSize="13" FontWeight="SemiBold"/>
-              <TextBlock Text="Augments the curated 27-driver BYOVD list with ~500 community-maintained entries from loldrivers.io. Weekly refresh, ~600KB cache." Foreground="{DynamicResource BrushFgFaint}" FontSize="10" TextWrapping="Wrap" MaxWidth="560"/>
-              <TextBlock x:Name="VulnDriverStatus" Text="" Foreground="{DynamicResource BrushFgFaint}" FontSize="10" Margin="0,4,0,0"/>
-            </StackPanel>
-          </CheckBox>
-          <CheckBox x:Name="SchedScanCheck" Foreground="{DynamicResource BrushFgPrimary}" Margin="0,0,0,4">
-            <StackPanel>
-              <TextBlock Text="Scheduled diagnostic re-scan" FontSize="13" FontWeight="SemiBold"/>
-              <TextBlock Text="Re-runs the full ~20-category diagnostic scan at a fixed interval. Useful for unattended monitoring sessions or generating trend data alongside the Prometheus endpoint." Foreground="{DynamicResource BrushFgFaint}" FontSize="10" TextWrapping="Wrap" MaxWidth="560"/>
-            </StackPanel>
-          </CheckBox>
-          <StackPanel Orientation="Horizontal" Margin="22,4,0,4">
-            <TextBlock Text="Interval (minutes):" Foreground="{DynamicResource BrushFgMuted}" FontSize="11" VerticalAlignment="Center" Margin="0,0,6,0"/>
-            <TextBox x:Name="SchedIntervalBox" Width="60" Background="{DynamicResource BrushCardBg}" Foreground="{DynamicResource BrushFgPrimary}" BorderBrush="{DynamicResource BrushBorder}" Padding="6,3" CaretBrush="#58a6ff"
-                     ToolTip="Minimum 5. Typical: 60 (hourly), 360 (every 6h), 1440 (daily)."/>
-            <CheckBox x:Name="SchedDigestCheck" Content="also write Reports\Digests\digest-*.html + CSV" Foreground="{DynamicResource BrushFgPrimary}" VerticalAlignment="Center" Margin="14,0,0,0" FontSize="11"/>
-          </StackPanel>
-          <TextBlock x:Name="SchedStatus" Text="" Foreground="{DynamicResource BrushFgFaint}" FontSize="10" Margin="22,4,0,0"/>
-        </StackPanel>
-        <StackPanel Grid.Row="7" Orientation="Horizontal" HorizontalAlignment="Right">
+        <TabControl Grid.Row="0" Background="Transparent" BorderBrush="{DynamicResource BrushBorder}" BorderThickness="1">
+            <TabItem Header="General">
+                <StackPanel Margin="14">
+                    <TextBlock Text="HTTP STATUS PORT" Foreground="{DynamicResource BrushFgMuted}" FontSize="11" Margin="0,0,0,4"/>
+                    <TextBox  x:Name="PortBox" Background="{DynamicResource BrushCardBg}" Foreground="{DynamicResource BrushFgPrimary}" BorderBrush="{DynamicResource BrushBorder}" Padding="8,5" Margin="0,0,0,12" CaretBrush="#58a6ff"
+                              ToolTip="HTTP server listens on http://localhost:port/. Endpoints: /status.json /health /findings.json /metrics (Prometheus)"/>
+                    <TextBlock Text="WEBHOOK URL  (POSTed JSON on every flap)" Foreground="{DynamicResource BrushFgMuted}" FontSize="11" Margin="0,0,0,4"/>
+                    <TextBox  x:Name="WebhookBox" Background="{DynamicResource BrushCardBg}" Foreground="{DynamicResource BrushFgPrimary}" BorderBrush="{DynamicResource BrushBorder}" Padding="8,5" Margin="0,0,0,4" CaretBrush="#58a6ff"/>
+                    <TextBlock Text="Examples:  https://hooks.slack.com/services/...  -or-  https://ntfy.sh/your-topic" Foreground="{DynamicResource BrushFgFaint}" FontSize="10" Margin="0,0,0,12"/>
+                </StackPanel>
+            </TabItem>
+            <TabItem Header="Threat-intel">
+                <StackPanel Margin="14">
+                    <Grid Margin="0,0,0,12">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                      </Grid.ColumnDefinitions>
+                      <CheckBox Grid.Column="0" x:Name="ThreatIntelCheck" Foreground="{DynamicResource BrushFgPrimary}" VerticalAlignment="Top">
+                        <StackPanel>
+                          <TextBlock x:Name="ThreatIntelLabel" Text="Threat-intel feeds" FontSize="13" FontWeight="SemiBold"/>
+                          <TextBlock Text="OPT-IN. Downloads public IP blocklists every 24h and cross-references the connection ledger against them. Hits surface as FAIL findings with the T1071 ATT&amp;CK chip." Foreground="{DynamicResource BrushFgFaint}" FontSize="10" TextWrapping="Wrap" MaxWidth="490"/>
+                          <TextBlock x:Name="ThreatIntelStatus" Text="" Foreground="{DynamicResource BrushFgFaint}" FontSize="10" Margin="0,4,0,0"/>
+                        </StackPanel>
+                      </CheckBox>
+                      <Button Grid.Column="1" x:Name="ManageFeedsBtn" Content="Manage feeds..." Padding="10,4" VerticalAlignment="Top" Margin="10,0,0,0" Background="{DynamicResource BrushBorder}" Foreground="{DynamicResource BrushFgPrimary}" BorderBrush="{DynamicResource BrushHoverBg}"/>
+                    </Grid>
+                    <CheckBox x:Name="VulnDriverCheck" Foreground="{DynamicResource BrushFgPrimary}" Margin="0,0,0,10">
+                        <StackPanel>
+                          <TextBlock x:Name="VulnDriverLabel" Text="Vulnerable-driver list (loldrivers.io)" FontSize="13" FontWeight="SemiBold"/>
+                          <TextBlock Text="Augments the curated 27-driver BYOVD list with ~500 community-maintained entries from loldrivers.io. Weekly refresh, ~600KB cache." Foreground="{DynamicResource BrushFgFaint}" FontSize="10" TextWrapping="Wrap" MaxWidth="610"/>
+                          <TextBlock x:Name="VulnDriverStatus" Text="" Foreground="{DynamicResource BrushFgFaint}" FontSize="10" Margin="0,4,0,0"/>
+                        </StackPanel>
+                    </CheckBox>
+                </StackPanel>
+            </TabItem>
+            <TabItem Header="Scheduled scans">
+                <StackPanel Margin="14">
+                    <CheckBox x:Name="SchedScanCheck" Foreground="{DynamicResource BrushFgPrimary}" Margin="0,0,0,4">
+                        <StackPanel>
+                          <TextBlock Text="Scheduled diagnostic re-scan" FontSize="13" FontWeight="SemiBold"/>
+                          <TextBlock Text="Re-runs the full ~20-category diagnostic scan at a fixed interval. Useful for unattended monitoring sessions or generating trend data alongside the Prometheus endpoint." Foreground="{DynamicResource BrushFgFaint}" FontSize="10" TextWrapping="Wrap" MaxWidth="610"/>
+                        </StackPanel>
+                    </CheckBox>
+                    <StackPanel Orientation="Horizontal" Margin="22,4,0,4">
+                        <TextBlock Text="Interval (minutes):" Foreground="{DynamicResource BrushFgMuted}" FontSize="11" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                        <TextBox x:Name="SchedIntervalBox" Width="60" Background="{DynamicResource BrushCardBg}" Foreground="{DynamicResource BrushFgPrimary}" BorderBrush="{DynamicResource BrushBorder}" Padding="6,3" CaretBrush="#58a6ff"
+                                 ToolTip="Minimum 5. Typical: 60 (hourly), 360 (every 6h), 1440 (daily)."/>
+                        <CheckBox x:Name="SchedDigestCheck" Content="also write Reports\Digests\digest-*.html + CSV" Foreground="{DynamicResource BrushFgPrimary}" VerticalAlignment="Center" Margin="14,0,0,0" FontSize="11"/>
+                    </StackPanel>
+                    <TextBlock x:Name="SchedStatus" Text="" Foreground="{DynamicResource BrushFgFaint}" FontSize="10" Margin="22,4,0,0"/>
+                </StackPanel>
+            </TabItem>
+            <TabItem Header="HTTP auth">
+                <StackPanel Margin="14">
+                    <TextBlock Text="Local HTTP server bearer-token authentication" Foreground="#58a6ff" FontWeight="SemiBold" FontSize="12" Margin="0,0,0,6"/>
+                    <TextBlock Foreground="{DynamicResource BrushFgFaint}" FontSize="10" TextWrapping="Wrap" Margin="0,0,0,8"
+                               Text="When set, /status.json /findings.json /causes.json /ledger.json /metrics all require Authorization: Bearer &lt;token&gt;. /health stays anonymous for uptime probes. Leave empty for anonymous mode."/>
+                    <TextBlock Text="BEARER TOKEN" Foreground="{DynamicResource BrushFgMuted}" FontSize="11" Margin="0,0,0,4"/>
+                    <TextBox x:Name="HttpAuthTokenBox" Background="{DynamicResource BrushCardBg}" Foreground="{DynamicResource BrushFgPrimary}" BorderBrush="{DynamicResource BrushBorder}" Padding="8,5" Margin="0,0,0,4" CaretBrush="#58a6ff" FontFamily="Consolas"/>
+                    <TextBlock Foreground="{DynamicResource BrushFgFaint}" FontSize="10" Text="Example fetch:  curl -H 'Authorization: Bearer YOUR-TOKEN' http://localhost:8765/status.json"/>
+                </StackPanel>
+            </TabItem>
+        </TabControl>
+        <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
             <Button x:Name="TestBtn"   Content="Test webhook" Padding="12,5" Margin="0,0,8,0" Background="{DynamicResource BrushBorder}" Foreground="{DynamicResource BrushFgPrimary}" BorderBrush="{DynamicResource BrushHoverBg}"/>
             <Button x:Name="SaveBtn"   Content="Save"         Padding="14,5" Margin="0,0,8,0" Background="#1f6feb" Foreground="#ffffff" BorderBrush="#2f7fff"/>
             <Button x:Name="CancelBtn" Content="Cancel"       Padding="12,5" Background="{DynamicResource BrushBorder}" Foreground="{DynamicResource BrushFgPrimary}" BorderBrush="{DynamicResource BrushHoverBg}"/>
@@ -15709,6 +15597,12 @@ function Show-SettingsDialog {
         $schedStatus.Text = 'Next run: not yet scheduled (enable + Save to start the timer)'
     }
 
+    # v1.4 HTTP auth token (lives on the HTTP auth tab now)
+    $authTokenBox = $w.FindName('HttpAuthTokenBox')
+    if ($authTokenBox) {
+        $authTokenBox.Text = if ($script:State.Settings.HttpAuthToken) { [string]$script:State.Settings.HttpAuthToken } else { '' }
+    }
+
     $w.FindName('TestBtn').Add_Click({
         $url = $webhookBox.Text.Trim()
         if (-not $url) { [System.Windows.MessageBox]::Show($w, 'Enter a URL first.','No URL','OK','Information') | Out-Null; return }
@@ -15748,6 +15642,11 @@ function Show-SettingsDialog {
             $script:State.Settings | Add-Member -NotePropertyName ScheduledScanEnabled      -NotePropertyValue $schedNew -Force
             $script:State.Settings | Add-Member -NotePropertyName ScheduledScanIntervalMin  -NotePropertyValue $schedInt -Force
             $script:State.Settings | Add-Member -NotePropertyName ScheduledDigestEnabled    -NotePropertyValue $schedDig -Force
+            # v1.5: HTTP auth token from the new HTTP-auth tab.
+            if ($authTokenBox) {
+                $authTok = ([string]$authTokenBox.Text).Trim()
+                $script:State.Settings | Add-Member -NotePropertyName HttpAuthToken         -NotePropertyValue $authTok  -Force
+            }
             Save-Settings $script:State.Settings
             Add-Event info ("Settings saved: HTTP port {0}, webhook {1}, threat-intel {2}, vuln-drv {3}, sched-scan {4}{5}" -f $port, $(if ($url) { 'set' } else { 'cleared' }), $(if ($tiNew) { 'ON' } else { 'OFF' }), $(if ($vdNew) { 'ON' } else { 'OFF' }), $(if ($schedNew) { 'ON' } else { 'OFF' }), $(if ($schedNew) { (' (every ' + $schedInt + 'min, digest=' + $schedDig + ')') } else { '' }))
 
