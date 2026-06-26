@@ -10172,6 +10172,9 @@ $script:State = [pscustomobject]@{
     VulnDriverJob    = $null
     # GeoIP database fetch job (DB-IP Lite country CSV).
     GeoIpJob         = $null
+    # IP-to-ASN database fetch job (DB-IP ASN Lite CSV).
+    IpAsnJob         = $null
+    NextIpAsnRefreshAt = $null
     # Auto-trigger state (Settings.AutoTriggerOnRetrans). Sustain counter is in heavy-ticks (2s each).
     AutoTriggerSustainCount = 0
     LastAutoTriggerAt       = $null
@@ -11409,6 +11412,15 @@ function Update-Findings {
             'Sysmon writes detailed events to Microsoft-Windows-Sysmon/Operational. Pair it with a config from SwiftOnSecurity or Olaf Hartong - the HUD will surface its events here once both are present.'))
     }
     } catch { try { Add-Event warn ("Section 'sysmon' failed: $($_.Exception.Message)") } catch {} }
+
+    # v1.5: BitLocker + Windows Update posture + suspicious listening ports (src/33).
+    _ScanYield 'Scanning: BitLocker + updates + listeners...'
+    try {
+        foreach ($f in @(Get-BitLockerFindings))     { $script:Findings.Add($f) }
+        foreach ($f in @(Get-WindowsUpdateFindings)) { $script:Findings.Add($f) }
+        foreach ($f in @(Get-SuspiciousPortFindings)){ $script:Findings.Add($f) }
+    } catch { try { Add-Event warn ("Section 'posture' failed: $($_.Exception.Message)") } catch {} }
+    _RebuildAndFilter
 
     # v1.4: kernel driver enumeration + boot posture (Secure Boot / TPM / VBS / HVCI). Both live
     # in src/30-kernel-driver-and-boot.ps1.
@@ -17882,6 +17894,22 @@ function Tick {
         $script:State.SinkholeJob = $null
     }
 
+    # ---- IP-ASN database (DB-IP ASN Lite) job poll ----
+    if ($script:State.IpAsnJob -and $script:State.IpAsnJob.State -in 'Completed','Failed','Stopped') {
+        try {
+            $r = Receive-Job $script:State.IpAsnJob -Keep -ErrorAction SilentlyContinue
+            if ($r -is [array]) { $r = $r | Where-Object { $_ -is [hashtable] -and $_.ContainsKey('Ok') } | Select-Object -First 1 }
+            if ($r -and $r.Ok) {
+                Add-Event recovery ("IP-ASN database fetched: {0} KB. Parsing..." -f $r.SizeKB)
+                if (Load-IpAsnDatabase) {
+                    Add-Event recovery ("IP-ASN loaded: {0:N0} IPv4 ranges (DB-IP ASN Lite)" -f @($script:IpAsnRangesV4).Count)
+                } else { Add-Event warn 'IP-ASN parse failed.' }
+            } elseif ($r) { Add-Event warn ("IP-ASN fetch failed: {0}" -f $r.Error) }
+        } catch { try { Add-Event warn ("IP-ASN job error: $($_.Exception.Message)") } catch {} }
+        Remove-Job $script:State.IpAsnJob -Force -ErrorAction SilentlyContinue
+        $script:State.IpAsnJob = $null
+    }
+
     # ---- GeoIP database (DB-IP Lite) job poll ----
     if ($script:State.GeoIpJob -and $script:State.GeoIpJob.State -in 'Completed','Failed','Stopped') {
         try {
@@ -19705,6 +19733,18 @@ if (-not $script:CliMode) {
         $hrs = if ($script:State.Settings.GeoIpAutoRefreshHours) { [int]$script:State.Settings.GeoIpAutoRefreshHours } else { 720 }
         if ($hrs -lt 24) { $hrs = 720 }
         $script:State.NextGeoIpRefreshAt = (Get-Date).AddHours($hrs)
+        # v1.5: IP-to-ASN database (DB-IP ASN Lite). Same lifecycle as GeoIP.
+        if (Load-IpAsnDatabase) {
+            Add-Event info ("IP-ASN cache loaded: {0:N0} IPv4 ranges" -f @($script:IpAsnRangesV4).Count)
+            try {
+                $age2 = (Get-Date) - (Get-Item $script:IpAsnDbPath).LastWriteTime
+                if ($age2.TotalHours -gt $script:IpAsnTtlHours) { Update-IpAsnDatabase }
+            } catch {}
+        } else {
+            Add-Event info 'IP-ASN DB: no cache yet, fetching from db-ip.com (one-time, ~10 MB)...'
+            Update-IpAsnDatabase
+        }
+        $script:State.NextIpAsnRefreshAt = (Get-Date).AddHours($hrs)
     }
 }
 

@@ -19,11 +19,21 @@ function Show-LedgerSearchDialog {
         try { $cc = Get-IpCountry $v.ip } catch {}
         $threat = ''
         try { $threat = Test-IpThreat -Ip $v.ip } catch {}
+        $asnText = ''
+        try {
+            $asn = Get-IpAsn -Ip $v.ip
+            if ($asn) {
+                $orgShort = [string]$asn.Org
+                if ($orgShort.Length -gt 35) { $orgShort = $orgShort.Substring(0,35) + '...' }
+                $asnText = "AS$($asn.Asn)  $orgShort"
+            }
+        } catch {}
         $rows.Add([pscustomobject]@{
             Process   = [string]$v.proc
             IP        = [string]$v.ip
             Port      = [int]$v.port
             Country   = if ($cc) { [string]$cc } else { '' }
+            ASN       = $asnText
             Threat    = if ($threat) { [string]$threat } else { '' }
             FirstSeen = [string]$v.firstSeen
             LastSeen  = [string]$v.lastSeen
@@ -69,6 +79,7 @@ function Show-LedgerSearchDialog {
                     <GridViewColumn Header="IP"      Width="150" DisplayMemberBinding="{Binding IP}"/>
                     <GridViewColumn Header="Port"    Width="70"  DisplayMemberBinding="{Binding Port}"/>
                     <GridViewColumn Header="CC"      Width="50"  DisplayMemberBinding="{Binding Country}"/>
+                    <GridViewColumn Header="ASN"     Width="220" DisplayMemberBinding="{Binding ASN}"/>
                     <GridViewColumn Header="Threat"  Width="120" DisplayMemberBinding="{Binding Threat}"/>
                     <GridViewColumn Header="Samples" Width="80"  DisplayMemberBinding="{Binding Samples}"/>
                     <GridViewColumn Header="Last Seen" Width="170" DisplayMemberBinding="{Binding LastSeen}"/>
@@ -101,7 +112,7 @@ function Show-LedgerSearchDialog {
                 return
             }
             $filtered = @($rows | Where-Object {
-                $hay = ("{0}|{1}|{2}|{3}|{4}|{5}" -f $_.Process, $_.IP, $_.Port, $_.Country, $_.Threat, $_.Label).ToLower()
+                $hay = ("{0}|{1}|{2}|{3}|{4}|{5}|{6}" -f $_.Process, $_.IP, $_.Port, $_.Country, $_.ASN, $_.Threat, $_.Label).ToLower()
                 $hay.Contains($f)
             })
             $list.ItemsSource = $filtered
@@ -116,7 +127,7 @@ function Show-LedgerSearchDialog {
             $dlg.Filter = 'CSV (*.csv)|*.csv'
             if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
                 $items = $list.ItemsSource
-                $items | Select-Object Process,IP,Port,Country,Threat,Samples,FirstSeen,LastSeen,Label | Export-Csv -Path $dlg.FileName -NoTypeInformation -Encoding UTF8
+                $items | Select-Object Process,IP,Port,Country,ASN,Threat,Samples,FirstSeen,LastSeen,Label | Export-Csv -Path $dlg.FileName -NoTypeInformation -Encoding UTF8
                 try { Add-Event info ("Ledger export: $($dlg.FileName)") } catch {}
             }
         }.GetNewClosure())

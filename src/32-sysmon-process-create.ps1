@@ -69,9 +69,18 @@ function Get-SysmonProcessCreateFindings {
 
             $shortCmd = $cmd
             if ($shortCmd.Length -gt 120) { $shortCmd = $shortCmd.Substring(0,120) + '...' }
+            # v1.5: if the command-line has -EncodedCommand / -enc, decode and inline. Common
+            # malware tradecraft: base64-encode the actual payload to evade scanning.
+            $decoded = $null
+            try { $decoded = Decode-EncodedPowerShellCommand -CommandLine $cmd } catch {}
+            $detail = "Sysmon Event 1 caught a parent->child chain matching a well-known attack pattern. User: $userTxt. Inspect the full command-line + binary signing on the PROCESSES tab."
+            if ($decoded) {
+                $shortDecoded = if ($decoded.Length -gt 400) { $decoded.Substring(0,400) + '...' } else { $decoded }
+                $detail += "`n`nDecoded -EncodedCommand:`n$shortDecoded"
+            }
             [void]$out.Add((Add-Finding 'WARN' 'Sysmon' ("{0}  ({1})" -f $matched, $shortCmd) `
                 "Kill the child process if you didn't trigger it. Review parent doc for macros: open in Protected View, disable macros, scan with Defender." `
-                "Sysmon Event 1 caught a parent->child chain matching a well-known attack pattern. User: $userTxt. Inspect the full command-line + binary signing on the PROCESSES tab." `
+                $detail `
                 $mitre))
         }
     } catch {
